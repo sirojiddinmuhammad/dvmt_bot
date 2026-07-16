@@ -168,10 +168,19 @@ async def ustoz_guruhlari(ustoz_page):
     guruhlar = []
     for ref in guruh_refs:
         g = await notion_get_page(ref["id"])
+
+        nom = title_matn(g, "Guruh nomi")
+
+        # 1-filtr: Status
         status = g["properties"].get("Status", {}).get("status")
         status_nomi = status["name"] if status else ""
         if status_nomi == "Guruh yopilgan":
             continue
+
+        # 2-filtr: nomida "yopilgan" so'zi bo'lsa
+        if "yopilgan" in nom.lower():
+            continue
+
         guruhlar.append(g)
     return guruhlar
 
