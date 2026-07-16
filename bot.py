@@ -34,6 +34,7 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 # Notion database ID lari
 DB_USTOZLAR = "11b88936578b468d991915cd5b527120"
@@ -436,7 +437,7 @@ MENYU = ReplyKeyboardMarkup(
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Botni ishga tushirish + Telegram ID ni ko'rsatish."""
+    """Botni ishga tushirish yoki ro'yxatdan o'tish."""
     user = update.effective_user
     ustoz = await ustozni_top(user.id)
 
@@ -447,14 +448,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Quyidagi tugmalardan foydalaning 👇",
             reply_markup=MENYU,
         )
-    else:
-        await update.message.reply_text(
-            f"Assalomu alaykum, {user.first_name}!\n\n"
-            f"Sizning Telegram ID raqamingiz:\n"
-            f"`{user.id}`\n\n"
-            f"Bu raqamni markaz ma'muriga yuboring.",
-            parse_mode="Markdown",
-        )
+        context.user_data.pop("ism_kutilyapti", None)
+        return
+
+    # Yangi foydalanuvchi - ism so'raymiz
+    context.user_data["ism_kutilyapti"] = True
+    await update.message.reply_text(
+        f"Assalomu alaykum!\n\n"
+        f"Siz hali ro'yxatda yo'qsiz.\n\n"
+        f"📝 *Markazdagi ismingizni yozing*\n"
+        f"_(Notiondagi kabi, masalan: Ummu Aisha)_",
+        parse_mode="Markdown",
+    )
 
 
 async def tekshir(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1180,6 +1185,237 @@ async def qoldirish_sabab(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
+#  RO'YXATDAN O'TISH
+# ─────────────────────────────────────────────
+
+# Kutilayotgan so'rovlar: {so'rov_id: {tg_id, ism, username, ustoz_id}}
+SOROVLAR = {}
+
+
+async def ustozni_ism_bilan_top(ism: str):
+    """Ustozlar bazasidan ism bo'yicha qidiradi (taxminiy moslik)."""
+    hammasi = await notion_query(DB_USTOZLAR)
+    ism_toza = ism.strip().lower()
+
+    aniq = []
+    taxminiy = []
+
+    for u in hammasi:
+        u_ism = title_matn(u, "Ustoz ismi")
+        u_toza = u_ism.strip().lower()
+
+        if u_toza == ism_toza:
+            aniq.append(u)
+        elif ism_toza in u_toza or u_toza in ism_toza:
+            taxminiy.append(u)
+
+    return aniq if aniq else taxminiy
+
+
+async def ism_qabul(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Yangi ustoz ismini yozdi -> adminga so'rov yuboradi."""
+    user = update.effective_user
+    ism = update.message.text.strip()
+
+    # Allaqachon ro'yxatdami?
+    mavjud = await ustozni_top(user.id)
+    if mavjud:
+        await update.message.reply_text(
+            f"✅ Siz allaqachon ro'yxatdasiz.", reply_markup=MENYU
+        )
+        context.user_data.pop("ism_kutilyapti", None)
+        return
+
+    if len(ism) < 3:
+        await update.message.reply_text(
+            "❌ Ism juda qisqa. To'liq ismingizni yozing."
+        )
+        return
+
+    kutish = await update.message.reply_text("⏳ Tekshirilmoqda...")
+
+    # Notiondan qidiramiz
+    try:
+        topilgan = await ustozni_ism_bilan_top(ism)
+    except Exception as e:
+        log.exception("ism qidirishda xato")
+        topilgan = []
+
+    context.user_data.pop("ism_kutilyapti", None)
+
+    # So'rovni saqlaymiz
+    sorov_id = str(user.id)
+    SOROVLAR[sorov_id] = {
+        "tg_id": user.id,
+        "ism": ism,
+        "username": user.username or "—",
+        "ustoz_id": topilgan[0]["id"] if len(topilgan) == 1 else None,
+        "ustoz_ism": title_matn(topilgan[0], "Ustoz ismi") if len(topilgan) == 1 else None,
+    }
+
+    await kutish.edit_text(
+        f"✅ *So'rovingiz yuborildi*\n\n"
+        f"👤 {ism}\n\n"
+        f"Admin tasdiqlagach xabar beramiz.",
+        parse_mode="Markdown",
+    )
+
+    # Adminga yuboramiz
+    if not ADMIN_ID:
+        log.warning("ADMIN_ID sozlanmagan!")
+        return
+
+    if len(topilgan) == 1:
+        holat = f"✅ Notionda topildi: *{title_matn(topilgan[0], 'Ustoz ismi')}*"
+        tugmalar = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"ok:{sorov_id}")],
+            [InlineKeyboardButton("❌ Rad etish", callback_data=f"no:{sorov_id}")],
+        ])
+    elif len(topilgan) > 1:
+        nomlar = ", ".join(title_matn(u, "Ustoz ismi") for u in topilgan[:5])
+        holat = f"⚠️ Notionda {len(topilgan)} ta o'xshash:\n_{nomlar}_\n\nQo'lda tanlang:"
+        tugmalar = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(
+                    f"✅ {title_matn(u, 'Ustoz ismi')}",
+                    callback_data=f"ok:{sorov_id}:{i}"
+                )]
+                for i, u in enumerate(topilgan[:5])
+            ]
+            + [[InlineKeyboardButton("❌ Rad etish", callback_data=f"no:{sorov_id}")]]
+        )
+        SOROVLAR[sorov_id]["variantlar"] = [
+            {"id": u["id"], "ism": title_matn(u, "Ustoz ismi")} for u in topilgan[:5]
+        ]
+    else:
+        holat = "❌ Notionda bunday ism topilmadi"
+        tugmalar = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Rad etish", callback_data=f"no:{sorov_id}")],
+        ])
+
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"👤 *Yangi ustoz so'rovi*\n\n"
+                f"Yozgan ismi: *{ism}*\n"
+                f"Telegram: @{user.username or '—'}\n"
+                f"ID: `{user.id}`\n\n"
+                f"{holat}"
+            ),
+            parse_mode="Markdown",
+            reply_markup=tugmalar,
+        )
+    except Exception as e:
+        log.exception(f"Adminga yuborishda xato: {e}")
+
+
+async def sorov_tasdiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin tasdiqladi -> Notionga Telegram ID yoziladi."""
+    q = update.callback_query
+
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Sizda ruxsat yo'q", show_alert=True)
+        return
+
+    await q.answer()
+
+    qismlar = q.data.split(":")
+    sorov_id = qismlar[1]
+    variant_i = int(qismlar[2]) if len(qismlar) > 2 else None
+
+    sorov = SOROVLAR.get(sorov_id)
+    if not sorov:
+        await q.edit_message_text(
+            "⚠️ *So'rov eskirdi*\n\n"
+            "Bot qayta ishga tushgan bo'lishi mumkin.\n"
+            f"Ustozdan /start ni qayta bosishini so'rang.\n\n"
+            f"Yoki ID ni qo'lda yozing: `{sorov_id}`",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Qaysi ustoz?
+    if variant_i is not None:
+        variant = sorov["variantlar"][variant_i]
+        ustoz_id = variant["id"]
+        ustoz_ism = variant["ism"]
+    else:
+        ustoz_id = sorov["ustoz_id"]
+        ustoz_ism = sorov["ustoz_ism"]
+
+    if not ustoz_id:
+        await q.edit_message_text("⚠️ Ustoz tanlanmagan.")
+        return
+
+    await q.edit_message_text("⏳ Notionga yozilmoqda...")
+
+    try:
+        await notion_update_page(
+            ustoz_id,
+            {"Telegram ID": {"number": sorov["tg_id"]}},
+        )
+
+        await q.edit_message_text(
+            f"✅ *Tasdiqlandi*\n\n"
+            f"👤 {ustoz_ism}\n"
+            f"ID: `{sorov['tg_id']}`\n\n"
+            f"Notionga yozildi.",
+            parse_mode="Markdown",
+        )
+
+        # Ustozga xabar
+        try:
+            await context.bot.send_message(
+                chat_id=sorov["tg_id"],
+                text=(
+                    f"✅ *Tasdiqlandi!*\n\n"
+                    f"Assalomu alaykum, {ustoz_ism}!\n"
+                    f"Endi botdan foydalanishingiz mumkin 👇"
+                ),
+                parse_mode="Markdown",
+                reply_markup=MENYU,
+            )
+        except Exception as e:
+            log.warning(f"Ustozga xabar yuborilmadi: {e}")
+
+        SOROVLAR.pop(sorov_id, None)
+
+    except Exception as e:
+        log.exception("sorov_tasdiq xatosi")
+        await q.edit_message_text(f"⚠️ Xatolik:\n{e}")
+
+
+async def sorov_rad(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin rad etdi."""
+    q = update.callback_query
+
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Sizda ruxsat yo'q", show_alert=True)
+        return
+
+    await q.answer()
+
+    sorov_id = q.data.split(":")[1]
+    sorov = SOROVLAR.get(sorov_id)
+
+    if sorov:
+        try:
+            await context.bot.send_message(
+                chat_id=sorov["tg_id"],
+                text=(
+                    "❌ So'rovingiz rad etildi.\n\n"
+                    "Savol bo'lsa markaz ma'muriyatiga murojaat qiling."
+                ),
+            )
+        except Exception:
+            pass
+        SOROVLAR.pop(sorov_id, None)
+
+    await q.edit_message_text("❌ Rad etildi.")
+
+
+# ─────────────────────────────────────────────
 #  MENYU TUGMALARI
 # ─────────────────────────────────────────────
 
@@ -1193,6 +1429,24 @@ async def menyu_matn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await dars_qoldirish(update, context)
     elif matn == "📅 Bugungi darslar":
         await bugungi_darslar(update, context)
+
+
+async def oddiy_matn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menyu tugmasi bo'lmagan matnlar - ism kutilayotgan bo'lsa qabul qilamiz."""
+    if context.user_data.get("ism_kutilyapti"):
+        await ism_qabul(update, context)
+        return
+
+    # Ro'yxatda bormi?
+    ustoz = await ustozni_top(update.effective_user.id)
+    if ustoz:
+        await update.message.reply_text(
+            "Quyidagi tugmalardan foydalaning 👇", reply_markup=MENYU
+        )
+    else:
+        await update.message.reply_text(
+            "Ro'yxatdan o'tish uchun /start ni bosing."
+        )
 
 
 # ─────────────────────────────────────────────
@@ -1213,6 +1467,10 @@ def main():
         menyu_matn,
     ))
 
+    # Ro'yxatdan o'tish (admin)
+    app.add_handler(CallbackQueryHandler(sorov_tasdiq, pattern="^ok:"))
+    app.add_handler(CallbackQueryHandler(sorov_rad, pattern="^no:"))
+
     # Davomat oqimi
     app.add_handler(CallbackQueryHandler(guruh_tanlandi, pattern="^g:"))
     app.add_handler(CallbackQueryHandler(sana_tanlandi, pattern="^s:"))
@@ -1229,6 +1487,11 @@ def main():
     app.add_handler(CallbackQueryHandler(qoldirish_guruh, pattern="^q:"))
     app.add_handler(CallbackQueryHandler(qoldirish_sana, pattern="^qs:"))
     app.add_handler(CallbackQueryHandler(qoldirish_sabab, pattern="^qb:"))
+
+    # Oddiy matn (ism qabul qilish) - eng oxirida bo'lishi kerak
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, oddiy_matn
+    ))
 
     # Tungi eslatma - har kuni 00:20 (Toshkent)
     app.job_queue.run_daily(
