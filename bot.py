@@ -1,4 +1,4 @@
-"""/Users/macbookprom3/Downloads/files/bot.py
+"""
 Annisaa Markaz - Davomat Bot
 =============================
 Ustozlar Telegram orqali davomat belgilaydi, natija Notionga yoziladi.
@@ -39,6 +39,9 @@ NOTION_HEADERS = {
     "Notion-Version": "2022-06-28",
     "Content-Type": "application/json",
 }
+
+# Data source ID lari (yangi Notion API uchun) - avtomatik topiladi
+DATA_SOURCE_CACHE = {}
 
 # Hafta kunlari: Notion nomi -> Python weekday raqami
 HAFTA_KUNLARI = {
@@ -81,6 +84,13 @@ async def notion_query(database_id: str, filter_obj=None):
                 headers=NOTION_HEADERS,
                 json=payload,
             )
+            if r.status_code == 404:
+                raise RuntimeError(
+                    f"Baza topilmadi (404).\n"
+                    f"ID: {database_id}\n\n"
+                    f"Sabab: integration bu bazaga ulanmagan yoki ID noto'g'ri.\n"
+                    f"/tekshir buyrug'ini yuboring."
+                )
             r.raise_for_status()
             data = r.json()
             results.extend(data["results"])
@@ -88,6 +98,21 @@ async def notion_query(database_id: str, filter_obj=None):
                 break
             payload["start_cursor"] = data["next_cursor"]
     return results
+
+
+async def notion_search_databases():
+    """Integration ko'ra oladigan barcha bazalarni topadi (diagnostika uchun)."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            f"{NOTION_API}/search",
+            headers=NOTION_HEADERS,
+            json={
+                "filter": {"property": "object", "value": "database"},
+                "page_size": 100,
+            },
+        )
+        r.raise_for_status()
+        return r.json()["results"]
 
 
 async def notion_get_page(page_id: str):
@@ -239,6 +264,76 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Bu raqamni markaz ma'muriga yuboring.",
             parse_mode="Markdown",
         )
+
+
+async def tekshir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diagnostika: bot qaysi bazalarni ko'ryapti?"""
+    kutish = await update.message.reply_text("⏳ Tekshirilmoqda...")
+
+    kerakli = {
+        DB_USTOZLAR.replace("-", ""): "🙂 Ustozlar",
+        DB_GURUHLAR.replace("-", ""): "🚪 Guruhlar",
+        DB_TOLOVLAR.replace("-", ""): "💎 To'lovlar",
+        DB_TOLIBALAR.replace("-", ""): "🎓 Tolibalar",
+        DB_DAVOMAT.replace("-", ""): "📋 Davomat",
+    }
+
+    try:
+        bazalar = await notion_search_databases()
+    except Exception as e:
+        await kutish.edit_text(f"⚠️ Notion API xatosi:\n{e}")
+        return
+
+    if not bazalar:
+        await kutish.edit_text(
+            "❌ Bot birorta ham bazani ko'rmayapti.\n\n"
+            "Sabab: integration hech qaysi bazaga ulanmagan.\n"
+            "Notionda: baza → ••• → Connections → Davomat bot"
+        )
+        return
+
+    korinadigan = {}
+    for b in bazalar:
+        bid = b["id"].replace("-", "")
+        nom = "(nomsiz)"
+        try:
+            t = b.get("title", [])
+            if t:
+                nom = t[0]["plain_text"]
+        except (KeyError, IndexError):
+            pass
+        korinadigan[bid] = nom
+
+    satrlar = [f"👁 Bot {len(korinadigan)} ta bazani ko'ryapti:\n"]
+
+    for bid, nom in korinadigan.items():
+        belgi = "✅" if bid in kerakli else "▪️"
+        satrlar.append(f"{belgi} {nom}")
+        if bid in kerakli:
+            satrlar.append(f"    `{bid}`")
+
+    satrlar.append("\n\n🔍 Kerakli bazalar holati:\n")
+    for bid, nom in kerakli.items():
+        if bid in korinadigan:
+            satrlar.append(f"✅ {nom} — topildi")
+        else:
+            satrlar.append(f"❌ {nom} — TOPILMADI")
+
+    yetishmayotgan = [n for b, n in kerakli.items() if b not in korinadigan]
+    if yetishmayotgan:
+        satrlar.append(
+            "\n\n⚠️ Yuqoridagi ❌ bazalarga integration ulanmagan "
+            "yoki ID noto'g'ri.\n"
+            "Notionda: baza → ••• → Connections → Davomat bot"
+        )
+    else:
+        satrlar.append("\n\n🎉 Hammasi joyida! /davomat ni sinang.")
+
+    matn = "\n".join(satrlar)
+    if len(matn) > 4000:
+        matn = matn[:4000] + "\n..."
+
+    await kutish.edit_text(matn, parse_mode="Markdown")
 
 
 async def davomat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -489,6 +584,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("davomat", davomat))
+    app.add_handler(CommandHandler("tekshir", tekshir))
     app.add_handler(CallbackQueryHandler(guruh_tanlandi, pattern="^g:"))
     app.add_handler(CallbackQueryHandler(sana_tanlandi, pattern="^s:"))
     app.add_handler(CallbackQueryHandler(talaba_bosildi, pattern="^t:"))
