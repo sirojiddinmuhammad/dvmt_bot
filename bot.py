@@ -308,26 +308,13 @@ async def tekshir(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for bid, nom in korinadigan.items():
         belgi = "✅" if bid in kerakli else "▪️"
-        satrlar.append(f"{belgi} {nom}")
-        if bid in kerakli:
-            satrlar.append(f"    `{bid}`")
+        satrlar.append(f"{belgi} *{nom}*")
+        satrlar.append(f"`{bid}`")
 
-    satrlar.append("\n\n🔍 Kerakli bazalar holati:\n")
+    satrlar.append("\n🔍 Kerakli bazalar:\n")
     for bid, nom in kerakli.items():
-        if bid in korinadigan:
-            satrlar.append(f"✅ {nom} — topildi")
-        else:
-            satrlar.append(f"❌ {nom} — TOPILMADI")
-
-    yetishmayotgan = [n for b, n in kerakli.items() if b not in korinadigan]
-    if yetishmayotgan:
-        satrlar.append(
-            "\n\n⚠️ Yuqoridagi ❌ bazalarga integration ulanmagan "
-            "yoki ID noto'g'ri.\n"
-            "Notionda: baza → ••• → Connections → Davomat bot"
-        )
-    else:
-        satrlar.append("\n\n🎉 Hammasi joyida! /davomat ni sinang.")
+        holat = "✅ topildi" if bid in korinadigan else "❌ TOPILMADI"
+        satrlar.append(f"{holat} — {nom}")
 
     matn = "\n".join(satrlar)
     if len(matn) > 4000:
