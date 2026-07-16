@@ -8,15 +8,24 @@ Muallif: Claude (Sirojiddin uchun)
 
 import os
 import logging
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time as dtime
+from zoneinfo import ZoneInfo
 
 import httpx
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 # ─────────────────────────────────────────────
@@ -32,6 +41,14 @@ DB_GURUHLAR = "10f5fce8a0b1451384a3d67c7bb99b9d"
 DB_TOLOVLAR = "64408559326f421e830d066a24024233"
 DB_TOLIBALAR = "4cf46df646394da3bfd2d7147ffde767"
 DB_DAVOMAT = "39ddd6064e4380afb4cddde1fab7947b"
+DB_GRAFIK = "39fdd6064e438063b5d0e50c9326dcb8"
+
+# Toshkent vaqti
+TZ = ZoneInfo("Asia/Tashkent")
+
+def bugun():
+    """Toshkent vaqti bo'yicha bugungi sana."""
+    return datetime.now(TZ).date()
 
 NOTION_API = "https://api.notion.com/v1"
 NOTION_HEADERS = {
@@ -135,6 +152,18 @@ async def notion_create_page(database_id: str, properties: dict):
                 "parent": {"database_id": database_id},
                 "properties": properties,
             },
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+async def notion_update_page(page_id: str, properties: dict):
+    """Notion sahifasini yangilaydi."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.patch(
+            f"{NOTION_API}/pages/{page_id}",
+            headers=NOTION_HEADERS,
+            json={"properties": properties},
         )
         r.raise_for_status()
         return r.json()
@@ -252,16 +281,16 @@ def dars_kunlari_sanalar(guruh_page, nechta=4):
     tanlangan = guruh_page["properties"].get("Dars kunlar", {}).get("multi_select", [])
     kun_nomlari = [k["name"] for k in tanlangan if k["name"] in HAFTA_KUNLARI]
 
-    bugun = date.today()
+    bugun_ = bugun()
 
     if not kun_nomlari:
         # Aniq kun belgilanmagan -> oxirgi 4 kunni beramiz
-        return [bugun - timedelta(days=i) for i in range(nechta)]
+        return [bugun_ - timedelta(days=i) for i in range(nechta)]
 
     weekdaylar = {HAFTA_KUNLARI[k] for k in kun_nomlari}
     sanalar = []
     for i in range(21):  # 3 hafta orqaga qaraymiz
-        kun = bugun - timedelta(days=i)
+        kun = bugun_ - timedelta(days=i)
         if kun.weekday() in weekdaylar:
             sanalar.append(kun)
         if len(sanalar) >= nechta:
@@ -275,9 +304,107 @@ def sana_matni(d: date):
     return f"{d.day}-{OYLAR[d.month - 1]} ({qisqa[d.weekday()]})"
 
 
+def guruh_vaqti(guruh_page):
+    """Guruhning dars vaqtini oladi."""
+    v = guruh_page["properties"].get("Dars vaqti", {})
+    if v.get("type") == "select" and v.get("select"):
+        return v["select"]["name"]
+    if v.get("type") == "rich_text" and v.get("rich_text"):
+        return v["rich_text"][0]["plain_text"]
+    return ""
+
+
+def bugun_darsmi(guruh_page, kun: date):
+    """Shu kuni guruhda dars bormi?"""
+    tanlangan = guruh_page["properties"].get("Dars kunlar", {}).get("multi_select", [])
+    nomlar = [k["name"] for k in tanlangan]
+
+    if "Har kuni" in nomlar:
+        return True
+
+    for n in nomlar:
+        if n in HAFTA_KUNLARI and HAFTA_KUNLARI[n] == kun.weekday():
+            return True
+    return False
+
+
+# ─────────────────────────────────────────────
+#  DARSLAR GRAFIGI
+# ─────────────────────────────────────────────
+
+async def grafik_topish(guruh_id: str, sana: str):
+    """Shu guruh+sana uchun grafik yozuvini topadi."""
+    natija = await notion_query(
+        DB_GRAFIK,
+        {
+            "and": [
+                {"property": "🚪 Guruhlar", "relation": {"contains": guruh_id}},
+                {"property": "Sana", "date": {"equals": sana}},
+            ]
+        },
+    )
+    return natija[0] if natija else None
+
+
+async def grafik_yozish(guruh_page, ustoz_page, sana: str, holat: str,
+                        sabab=None, izoh=None):
+    """
+    Grafik yozuvini yaratadi yoki yangilaydi.
+    holat: "Belgilanmagan" | "Dars boldi" | "Dars qoldirildi"
+    """
+    guruh_id = guruh_page["id"]
+    nom = title_matn(guruh_page, "Guruh nomi")
+    d = date.fromisoformat(sana)
+
+    props = {
+        "Name": {"title": [{"text": {"content": f"{nom} — {sana_matni(d)}"}}]},
+        "🚪 Guruhlar": {"relation": [{"id": guruh_id}]},
+        "Sana": {"date": {"start": sana}},
+        "Holat": {"status": {"name": holat}},
+        "Vaqti": {"rich_text": [{"text": {"content": guruh_vaqti(guruh_page)}}]},
+    }
+    if ustoz_page:
+        props["🙂 Ustozlar"] = {"relation": [{"id": ustoz_page["id"]}]}
+    if sabab:
+        props["Sabab"] = {"select": {"name": sabab}}
+    if izoh:
+        props["Izoh"] = {"rich_text": [{"text": {"content": izoh}}]}
+
+    mavjud = await grafik_topish(guruh_id, sana)
+    if mavjud:
+        await notion_update_page(mavjud["id"], props)
+        return mavjud["id"]
+    else:
+        yangi = await notion_create_page(DB_GRAFIK, props)
+        return yangi["id"]
+
+
+async def davomat_bormi(guruh_id: str, sana: str):
+    """Shu guruh+sana uchun davomat allaqachon kiritilganmi?"""
+    natija = await notion_query(
+        DB_DAVOMAT,
+        {
+            "and": [
+                {"property": "🚪 Guruhlar", "relation": {"contains": guruh_id}},
+                {"property": "Date", "date": {"equals": sana}},
+            ]
+        },
+    )
+    return len(natija)
+
+
 # ─────────────────────────────────────────────
 #  BOT BUYRUQLARI
 # ─────────────────────────────────────────────
+
+MENYU = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("📋 Davomat")],
+        [KeyboardButton("🚫 Dars qoldirish"), KeyboardButton("📅 Bugungi darslar")],
+    ],
+    resize_keyboard=True,
+)
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Botni ishga tushirish + Telegram ID ni ko'rsatish."""
@@ -288,7 +415,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ism = title_matn(ustoz, "Ustoz ismi")
         await update.message.reply_text(
             f"Assalomu alaykum, {ism}!\n\n"
-            f"Davomat belgilash uchun /davomat buyrug'ini yuboring."
+            f"Quyidagi tugmalardan foydalaning 👇",
+            reply_markup=MENYU,
         )
     else:
         await update.message.reply_text(
@@ -488,7 +616,12 @@ KEYINGI = {"Keldi": "Kelmadi", "Kelmadi": "Tatilda", "Tatilda": "Keldi"}
 
 
 async def royxatni_chiz(q, context):
-    """Talabalar ro'yxatini tugmalar bilan chizadi."""
+    """Talabalar ro'yxatini tugmalar bilan chizadi (callback query orqali)."""
+    await royxatni_chiz_xabar(q, context)
+
+
+async def royxatni_chiz_xabar(xabar_yoki_q, context):
+    """Talabalar ro'yxatini chizadi. xabar_yoki_q: Message yoki CallbackQuery."""
     talabalar = context.user_data["talabalar"]
     holatlar = context.user_data["holatlar"]
     guruh = context.user_data["guruh"]
@@ -511,17 +644,22 @@ async def royxatni_chiz(q, context):
 
     matn = (
         f"📚 *{title_matn(guruh, 'Guruh nomi')}*\n"
-        f"📅 {sana_matni(sana)}\n\n"
-        f"Talaba ismini bosib holatini o'zgartiring:\n"
+        f"📅 {sana_matni(sana)}  🕐 {guruh_vaqti(guruh)}\n\n"
+        f"Talaba ismini bosing:\n"
         f"✅ Keldi → ❌ Kelmadi → 🌙 Ta'tilda\n\n"
         f"✅ {keldi}  ❌ {kelmadi}  🌙 {tatil}"
     )
 
-    await q.edit_message_text(
-        matn,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(tugmalar),
-    )
+    if hasattr(xabar_yoki_q, "edit_message_text"):
+        await xabar_yoki_q.edit_message_text(
+            matn, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(tugmalar),
+        )
+    else:
+        await xabar_yoki_q.edit_text(
+            matn, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(tugmalar),
+        )
 
 
 async def talaba_bosildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -574,6 +712,12 @@ async def saqla(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await notion_create_page(DB_DAVOMAT, props)
             yozildi += 1
 
+        # Grafikka "Dars boldi" yozamiz
+        try:
+            await grafik_yozish(guruh, ustoz, sana, "Dars boldi")
+        except Exception as e:
+            log.warning(f"Grafikka yozishda xato: {e}")
+
         keldi = sum(1 for h in holatlar.values() if h == "Keldi")
         kelmadi = sum(1 for h in holatlar.values() if h == "Kelmadi")
         tatil = sum(1 for h in holatlar.values() if h == "Tatilda")
@@ -588,7 +732,8 @@ async def saqla(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Jami {yozildi} ta yozuv Notionga yozildi.",
             parse_mode="Markdown",
         )
-        context.user_data.clear()
+        for k in ["talabalar", "holatlar", "guruh", "sana"]:
+            context.user_data.pop(k, None)
 
     except Exception as e:
         log.exception("saqlash xatosi")
@@ -598,8 +743,9 @@ async def saqla(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bekor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    context.user_data.clear()
-    await q.edit_message_text("❌ Bekor qilindi.\n\nQaytadan: /davomat")
+    for k in ["talabalar", "holatlar", "guruh", "sana"]:
+        context.user_data.pop(k, None)
+    await q.edit_message_text("❌ Bekor qilindi.")
 
 
 async def orqaga(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -618,6 +764,355 @@ async def orqaga(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
+#  BUGUNGI DARSLAR / ESLATMA
+# ─────────────────────────────────────────────
+
+async def bugungi_darslar_matni(ustoz, kun: date):
+    """Ustozning shu kundagi darslarini topib, matn va tugmalar qaytaradi."""
+    guruhlar = await ustoz_guruhlari(ustoz)
+    bugungi = [g for g in guruhlar if bugun_darsmi(g, kun)]
+
+    if not bugungi:
+        return None, None, []
+
+    # Vaqt bo'yicha tartiblash
+    bugungi.sort(key=lambda g: guruh_vaqti(g) or "99:99")
+
+    satrlar = [f"🌅 *{sana_matni(kun)}*\n", f"Bugun sizda {len(bugungi)} ta dars bor:\n"]
+    tugmalar = []
+
+    for i, g in enumerate(bugungi):
+        nom = title_matn(g, "Guruh nomi")
+        vaqt = guruh_vaqti(g)
+        satrlar.append(f"🕐 *{vaqt}* — {nom}")
+        tugmalar.append([
+            InlineKeyboardButton(f"📋 {vaqt} {nom}", callback_data=f"e:{i}")
+        ])
+
+    satrlar.append("\n_Dars berib bo'lgach tugmani bosing._")
+
+    return "\n".join(satrlar), InlineKeyboardMarkup(tugmalar), bugungi
+
+
+async def bugungi_darslar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """📅 Bugungi darslar tugmasi."""
+    user = update.effective_user
+    kutish = await update.message.reply_text("⏳ Yuklanmoqda...")
+
+    ustoz = await ustozni_top(user.id)
+    if not ustoz:
+        await kutish.edit_text("❌ Siz ustozlar ro'yxatida topilmadingiz.")
+        return
+
+    kun = bugun()
+    matn, tugmalar, guruhlar = await bugungi_darslar_matni(ustoz, kun)
+
+    if not matn:
+        await kutish.edit_text(f"😌 {sana_matni(kun)}\n\nBugun darsingiz yo'q.")
+        return
+
+    context.user_data["eslatma_guruhlar"] = guruhlar
+    context.user_data["eslatma_sana"] = kun.isoformat()
+
+    await kutish.edit_text(matn, parse_mode="Markdown", reply_markup=tugmalar)
+
+
+async def tungi_eslatma(context: ContextTypes.DEFAULT_TYPE):
+    """Har kuni 00:20 da barcha ustozlarga bugungi darslarni yuboradi."""
+    kun = bugun()
+    log.info(f"Tungi eslatma boshlandi: {kun}")
+
+    try:
+        ustozlar = await notion_query(DB_USTOZLAR)
+    except Exception as e:
+        log.exception("Eslatma: ustozlarni olishda xato")
+        return
+
+    yuborildi = 0
+    for ustoz in ustozlar:
+        tg_id = ustoz["properties"].get("Telegram ID", {}).get("number")
+        if not tg_id:
+            continue
+
+        try:
+            matn, tugmalar, guruhlar = await bugungi_darslar_matni(ustoz, kun)
+            if not matn:
+                continue
+
+            # Har guruh uchun "Belgilanmagan" yozuv ochamiz
+            for g in guruhlar:
+                mavjud = await grafik_topish(g["id"], kun.isoformat())
+                if not mavjud:
+                    await grafik_yozish(g, ustoz, kun.isoformat(), "Belgilanmagan")
+
+            await context.bot.send_message(
+                chat_id=int(tg_id),
+                text=matn,
+                parse_mode="Markdown",
+                reply_markup=tugmalar,
+            )
+            yuborildi += 1
+
+        except Exception as e:
+            log.warning(f"Eslatma yuborilmadi (tg_id={tg_id}): {e}")
+
+    log.info(f"Tungi eslatma tugadi: {yuborildi} ta ustozga yuborildi")
+
+
+async def eslatma_tugma(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Eslatmadagi guruh tugmasi bosildi."""
+    q = update.callback_query
+    await q.answer()
+
+    i = int(q.data.split(":")[1])
+    guruhlar = context.user_data.get("eslatma_guruhlar")
+
+    # Eslatma eski bo'lsa, qaytadan yuklaymiz
+    if not guruhlar:
+        ustoz = await ustozni_top(q.from_user.id)
+        if not ustoz:
+            await q.message.reply_text("❌ Ustoz topilmadi.")
+            return
+        kun = bugun()
+        _, _, guruhlar = await bugungi_darslar_matni(ustoz, kun)
+        context.user_data["eslatma_guruhlar"] = guruhlar
+        context.user_data["eslatma_sana"] = kun.isoformat()
+
+    try:
+        guruh = guruhlar[i]
+    except (IndexError, TypeError):
+        await q.message.reply_text("⚠️ Eslatma eskirdi. 📅 Bugungi darslar ni bosing.")
+        return
+
+    sana = context.user_data.get("eslatma_sana", bugun().isoformat())
+
+    context.user_data["guruh"] = guruh
+    context.user_data["sana"] = sana
+
+    # Davomat allaqachon bormi?
+    soni = await davomat_bormi(guruh["id"], sana)
+    if soni:
+        tugmalar = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Qayta kiritish", callback_data="qayta")],
+            [InlineKeyboardButton("❌ Bekor", callback_data="bekor")],
+        ])
+        await q.message.reply_text(
+            f"⚠️ *{title_matn(guruh, 'Guruh nomi')}*\n"
+            f"{sana_matni(date.fromisoformat(sana))} uchun davomat "
+            f"allaqachon kiritilgan ({soni} ta yozuv).\n\n"
+            f"Qayta kiritsangiz, eski yozuvlar qoladi va yangilari qo'shiladi.",
+            parse_mode="Markdown",
+            reply_markup=tugmalar,
+        )
+        return
+
+    await talabalarni_yuklash(q, context, yangi_xabar=True)
+
+
+async def qayta_kiritish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await talabalarni_yuklash(q, context, yangi_xabar=False)
+
+
+async def talabalarni_yuklash(q, context, yangi_xabar=False):
+    """Talabalar ro'yxatini yuklab, ro'yxatni chizadi."""
+    guruh = context.user_data["guruh"]
+
+    if yangi_xabar:
+        xabar = await q.message.reply_text("⏳ Talabalar yuklanmoqda...")
+    else:
+        await q.edit_message_text("⏳ Talabalar yuklanmoqda...")
+        xabar = q.message
+
+    try:
+        debug = {}
+        talabalar = await guruh_talabalari(guruh, debug=debug)
+        if not talabalar:
+            await xabar.edit_text(
+                f"❌ Faol talaba topilmadi.\n\n"
+                f"📚 {title_matn(guruh, 'Guruh nomi')}\n"
+                f"Jami to'lovlar: {debug.get('jami_tolov', 0)} ta\n"
+                f"«O'qiyabdi»: {debug.get('tolov_soni', 0)} ta"
+            )
+            return
+
+        context.user_data["holatlar"] = {t["id"]: "Keldi" for t in talabalar}
+        context.user_data["talabalar"] = talabalar
+
+        await royxatni_chiz_xabar(xabar, context)
+
+    except Exception as e:
+        log.exception("talabalarni_yuklash xatosi")
+        await xabar.edit_text(f"⚠️ Xatolik:\n{e}")
+
+
+# ─────────────────────────────────────────────
+#  DARS QOLDIRISH
+# ─────────────────────────────────────────────
+
+SABABLAR = ["Kasallik", "Sayohat", "Oilaviy sabab", "Texnik muammo", "Boshqa"]
+
+
+async def dars_qoldirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🚫 Dars qoldirish tugmasi - guruhlarni ko'rsatadi."""
+    user = update.effective_user
+    kutish = await update.message.reply_text("⏳ Yuklanmoqda...")
+
+    ustoz = await ustozni_top(user.id)
+    if not ustoz:
+        await kutish.edit_text("❌ Siz ustozlar ro'yxatida topilmadingiz.")
+        return
+
+    guruhlar = await ustoz_guruhlari(ustoz)
+    if not guruhlar:
+        await kutish.edit_text("❌ Faol guruh topilmadi.")
+        return
+
+    context.user_data["guruhlar"] = guruhlar
+
+    tugmalar = [
+        [InlineKeyboardButton(title_matn(g, "Guruh nomi"), callback_data=f"q:{i}")]
+        for i, g in enumerate(guruhlar)
+    ]
+
+    await kutish.edit_text(
+        "🚫 *Dars qoldirish*\n\nQaysi guruh?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(tugmalar),
+    )
+
+
+async def qoldirish_guruh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Dars qoldirish uchun guruh tanlandi -> sanani so'raydi."""
+    q = update.callback_query
+    await q.answer()
+
+    i = int(q.data.split(":")[1])
+    guruhlar = context.user_data.get("guruhlar")
+    if not guruhlar:
+        await q.edit_message_text("⚠️ Sessiya eskirdi.")
+        return
+
+    guruh = guruhlar[i]
+    context.user_data["q_guruh"] = guruh
+
+    # Yaqin dars kunlari (bugundan oldinga ham, orqaga ham)
+    sanalar = []
+    kun = bugun()
+    for i in range(-7, 8):  # 1 hafta orqaga, 1 hafta oldinga
+        k = kun + timedelta(days=i)
+        if bugun_darsmi(guruh, k):
+            sanalar.append(k)
+    sanalar.sort(key=lambda d: abs((d - kun).days))
+    sanalar = sanalar[:5]
+    sanalar.sort()
+
+    if not sanalar:
+        sanalar = [kun]
+
+    context.user_data["q_sanalar"] = sanalar
+
+    tugmalar = []
+    for i, d in enumerate(sanalar):
+        belgi = "▪️"
+        if d == kun:
+            belgi = "📌"
+        elif d > kun:
+            belgi = "🔜"
+        tugmalar.append([
+            InlineKeyboardButton(f"{belgi} {sana_matni(d)}", callback_data=f"qs:{i}")
+        ])
+
+    await q.edit_message_text(
+        f"🚫 *{title_matn(guruh, 'Guruh nomi')}*\n\nQaysi kun darsi qoldiriladi?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(tugmalar),
+    )
+
+
+async def qoldirish_sana(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sana tanlandi -> sababni so'raydi."""
+    q = update.callback_query
+    await q.answer()
+
+    i = int(q.data.split(":")[1])
+    sanalar = context.user_data.get("q_sanalar")
+    if not sanalar:
+        await q.edit_message_text("⚠️ Sessiya eskirdi.")
+        return
+
+    d = sanalar[i]
+    context.user_data["q_sana"] = d.isoformat()
+
+    tugmalar = [
+        [InlineKeyboardButton(s, callback_data=f"qb:{j}")]
+        for j, s in enumerate(SABABLAR)
+    ]
+
+    guruh = context.user_data["q_guruh"]
+    await q.edit_message_text(
+        f"🚫 *{title_matn(guruh, 'Guruh nomi')}*\n"
+        f"📅 {sana_matni(d)}\n\n"
+        f"Sabab nima?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(tugmalar),
+    )
+
+
+async def qoldirish_sabab(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sabab tanlandi -> Notionga yozadi."""
+    q = update.callback_query
+    await q.answer()
+
+    j = int(q.data.split(":")[1])
+    sabab = SABABLAR[j]
+
+    guruh = context.user_data.get("q_guruh")
+    sana = context.user_data.get("q_sana")
+    if not guruh or not sana:
+        await q.edit_message_text("⚠️ Sessiya eskirdi.")
+        return
+
+    await q.edit_message_text("⏳ Saqlanmoqda...")
+
+    try:
+        ustoz = await ustozni_top(q.from_user.id)
+        await grafik_yozish(guruh, ustoz, sana, "Dars qoldirildi", sabab=sabab)
+
+        await q.edit_message_text(
+            f"✅ *Qayd etildi*\n\n"
+            f"📚 {title_matn(guruh, 'Guruh nomi')}\n"
+            f"📅 {sana_matni(date.fromisoformat(sana))}\n"
+            f"🚫 Dars qoldirildi\n"
+            f"📝 Sabab: {sabab}",
+            parse_mode="Markdown",
+        )
+        context.user_data.pop("q_guruh", None)
+        context.user_data.pop("q_sana", None)
+
+    except Exception as e:
+        log.exception("qoldirish_sabab xatosi")
+        await q.edit_message_text(f"⚠️ Xatolik:\n{e}")
+
+
+# ─────────────────────────────────────────────
+#  MENYU TUGMALARI
+# ─────────────────────────────────────────────
+
+async def menyu_matn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menyu tugmalarini ushlaydi."""
+    matn = update.message.text
+
+    if matn == "📋 Davomat":
+        await davomat(update, context)
+    elif matn == "🚫 Dars qoldirish":
+        await dars_qoldirish(update, context)
+    elif matn == "📅 Bugungi darslar":
+        await bugungi_darslar(update, context)
+
+
+# ─────────────────────────────────────────────
 #  ISHGA TUSHIRISH
 # ─────────────────────────────────────────────
 
@@ -627,12 +1122,37 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("davomat", davomat))
     app.add_handler(CommandHandler("tekshir", tekshir))
+    app.add_handler(CommandHandler("bugun", bugungi_darslar))
+
+    # Menyu tugmalari
+    app.add_handler(MessageHandler(
+        filters.Regex("^(📋 Davomat|🚫 Dars qoldirish|📅 Bugungi darslar)$"),
+        menyu_matn,
+    ))
+
+    # Davomat oqimi
     app.add_handler(CallbackQueryHandler(guruh_tanlandi, pattern="^g:"))
     app.add_handler(CallbackQueryHandler(sana_tanlandi, pattern="^s:"))
     app.add_handler(CallbackQueryHandler(talaba_bosildi, pattern="^t:"))
     app.add_handler(CallbackQueryHandler(saqla, pattern="^saqla$"))
     app.add_handler(CallbackQueryHandler(bekor, pattern="^bekor$"))
     app.add_handler(CallbackQueryHandler(orqaga, pattern="^orqaga$"))
+
+    # Eslatma
+    app.add_handler(CallbackQueryHandler(eslatma_tugma, pattern="^e:"))
+    app.add_handler(CallbackQueryHandler(qayta_kiritish, pattern="^qayta$"))
+
+    # Dars qoldirish
+    app.add_handler(CallbackQueryHandler(qoldirish_guruh, pattern="^q:"))
+    app.add_handler(CallbackQueryHandler(qoldirish_sana, pattern="^qs:"))
+    app.add_handler(CallbackQueryHandler(qoldirish_sabab, pattern="^qb:"))
+
+    # Tungi eslatma - har kuni 00:20 (Toshkent)
+    app.job_queue.run_daily(
+        tungi_eslatma,
+        time=dtime(hour=0, minute=20, tzinfo=TZ),
+        name="tungi_eslatma",
+    )
 
     log.info("Bot ishga tushdi ✅")
     app.run_polling()
