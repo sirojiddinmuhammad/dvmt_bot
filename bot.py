@@ -176,20 +176,43 @@ async def ustoz_guruhlari(ustoz_page):
     return guruhlar
 
 
-async def guruh_talabalari(guruh_page):
+async def guruh_talabalari(guruh_page, debug=None):
     """
     Guruhdagi faol talabalarni oladi.
     Yo'l: Guruh -> To'lovlar -> Toliba ismi -> Talaba
     Faqat Faoliyat = "O'qiyabdi" bo'lganlar.
     """
-    tolov_refs = guruh_page["properties"].get("💸 To’lovlar", {}).get("relation", [])
-    talabalar = {}  # id -> {ism, tg_id}  (takrorlanmasligi uchun dict)
+    props = guruh_page["properties"]
+
+    # To'lovlar relation ustunini topamiz (nomi turlicha bo'lishi mumkin)
+    tolov_refs = []
+    topilgan_ustun = None
+    for nom, qiymat in props.items():
+        if qiymat.get("type") == "relation" and "lov" in nom.lower():
+            tolov_refs = qiymat["relation"]
+            topilgan_ustun = nom
+            break
+
+    if debug is not None:
+        debug["tolov_ustuni"] = topilgan_ustun
+        debug["tolov_soni"] = len(tolov_refs)
+        debug["relation_ustunlar"] = [
+            n for n, v in props.items() if v.get("type") == "relation"
+        ]
+        debug["faoliyatlar"] = []
+
+    talabalar = {}
 
     for ref in tolov_refs:
         tolov = await notion_get_page(ref["id"])
 
         faoliyat = tolov["properties"].get("Faoliyat", {}).get("status")
-        if not faoliyat or faoliyat["name"] != "O'qiyabdi":
+        faoliyat_nomi = faoliyat["name"] if faoliyat else "(bo'sh)"
+
+        if debug is not None:
+            debug["faoliyatlar"].append(faoliyat_nomi)
+
+        if faoliyat_nomi != "O'qiyabdi":
             continue
 
         toliba_rel = tolov["properties"].get("Toliba ismi", {}).get("relation", [])
@@ -198,7 +221,7 @@ async def guruh_talabalari(guruh_page):
 
         talaba_id = toliba_rel[0]["id"]
         if talaba_id in talabalar:
-            continue  # allaqachon qo'shilgan
+            continue
 
         talaba = await notion_get_page(talaba_id)
         talabalar[talaba_id] = {
@@ -412,9 +435,26 @@ async def sana_tanlandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("⏳ Talabalar yuklanmoqda...")
 
     try:
-        talabalar = await guruh_talabalari(guruh)
+        debug = {}
+        talabalar = await guruh_talabalari(guruh, debug=debug)
         if not talabalar:
-            await q.edit_message_text("❌ Bu guruhda faol talaba topilmadi.")
+            from collections import Counter
+            hisob = Counter(debug.get("faoliyatlar", []))
+            faoliyat_matn = "\n".join(
+                f"   • {k}: {v} ta" for k, v in hisob.items()
+            ) or "   (birorta ham to'lov yo'q)"
+
+            await q.edit_message_text(
+                f"❌ Faol talaba topilmadi.\n\n"
+                f"🔍 *Tashxis:*\n"
+                f"To'lovlar ustuni: `{debug.get('tolov_ustuni')}`\n"
+                f"Bog'langan to'lovlar: {debug.get('tolov_soni', 0)} ta\n\n"
+                f"Faoliyat holatlari:\n{faoliyat_matn}\n\n"
+                f"Guruhdagi relation ustunlar:\n"
+                f"`{debug.get('relation_ustunlar')}`\n\n"
+                f"_Bot faqat «O'qiyabdi» bo'lganlarni oladi._",
+                parse_mode="Markdown",
+            )
             return
 
         # Boshlanishida hammasi "Keldi"
