@@ -163,12 +163,19 @@ async def ustozni_top(telegram_id: int):
 
 
 async def ustoz_guruhlari(ustoz_page):
-    """Ustozning guruhlarini oladi (yopilganlarni tashlab)."""
-    guruh_refs = ustoz_page["properties"].get("Guruhlar", {}).get("relation", [])
-    guruhlar = []
-    for ref in guruh_refs:
-        g = await notion_get_page(ref["id"])
+    """
+    Ustozning guruhlarini oladi (yopilganlarni tashlab).
+    Guruhlar bazasidan to'g'ridan-to'g'ri filtr bilan - relation limitisiz.
+    """
+    ustoz_id = ustoz_page["id"]
 
+    guruhlar_hammasi = await notion_query(
+        DB_GURUHLAR,
+        {"property": "Ustozalar", "relation": {"contains": ustoz_id}},
+    )
+
+    guruhlar = []
+    for g in guruhlar_hammasi:
         nom = title_matn(g, "Guruh nomi")
 
         # 1-filtr: Status
@@ -182,48 +189,43 @@ async def ustoz_guruhlari(ustoz_page):
             continue
 
         guruhlar.append(g)
-    return guruhlar
+
+    return sorted(guruhlar, key=lambda g: title_matn(g, "Guruh nomi"))
 
 
 async def guruh_talabalari(guruh_page, debug=None):
     """
     Guruhdagi faol talabalarni oladi.
-    Yo'l: Guruh -> To'lovlar -> Toliba ismi -> Talaba
-    Faqat Faoliyat = "O'qiyabdi" bo'lganlar.
+    To'lovlar bazasidan to'g'ridan-to'g'ri filtr bilan:
+      Guruhlar = shu guruh  VA  Faoliyat = "O'qiyabdi"
     """
-    props = guruh_page["properties"]
+    guruh_id = guruh_page["id"]
 
-    # To'lovlar relation ustunini topamiz (nomi turlicha bo'lishi mumkin)
-    tolov_refs = []
-    topilgan_ustun = None
-    for nom, qiymat in props.items():
-        if qiymat.get("type") == "relation" and "lov" in nom.lower():
-            tolov_refs = qiymat["relation"]
-            topilgan_ustun = nom
-            break
+    tolovlar = await notion_query(
+        DB_TOLOVLAR,
+        {
+            "and": [
+                {"property": "Guruhlar", "relation": {"contains": guruh_id}},
+                {"property": "Faoliyat", "status": {"equals": "O'qiyabdi"}},
+            ]
+        },
+    )
 
     if debug is not None:
-        debug["tolov_ustuni"] = topilgan_ustun
-        debug["tolov_soni"] = len(tolov_refs)
-        debug["relation_ustunlar"] = [
-            n for n, v in props.items() if v.get("type") == "relation"
-        ]
+        debug["tolov_soni"] = len(tolovlar)
+        # Umumiy holatni ham ko'rsatamiz (tashxis uchun)
+        hammasi = await notion_query(
+            DB_TOLOVLAR,
+            {"property": "Guruhlar", "relation": {"contains": guruh_id}},
+        )
+        debug["jami_tolov"] = len(hammasi)
         debug["faoliyatlar"] = []
+        for t in hammasi:
+            f = t["properties"].get("Faoliyat", {}).get("status")
+            debug["faoliyatlar"].append(f["name"] if f else "(bo'sh)")
 
     talabalar = {}
-
-    for ref in tolov_refs:
-        tolov = await notion_get_page(ref["id"])
-
-        faoliyat = tolov["properties"].get("Faoliyat", {}).get("status")
-        faoliyat_nomi = faoliyat["name"] if faoliyat else "(bo'sh)"
-
-        if debug is not None:
-            debug["faoliyatlar"].append(faoliyat_nomi)
-
-        if faoliyat_nomi != "O'qiyabdi":
-            continue
-
+    for tolov in tolovlar:
         toliba_rel = tolov["properties"].get("Toliba ismi", {}).get("relation", [])
         if not toliba_rel:
             continue
@@ -462,8 +464,8 @@ async def sana_tanlandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ Faol talaba topilmadi.\n\n"
                 f"📚 Guruh: *{title_matn(guruh, 'Guruh nomi')}*\n\n"
                 f"🔍 *Tashxis:*\n"
-                f"To'lovlar ustuni: `{debug.get('tolov_ustuni')}`\n"
-                f"Bog'langan to'lovlar: {debug.get('tolov_soni', 0)} ta\n\n"
+                f"Jami to'lovlar: {debug.get('jami_tolov', 0)} ta\n"
+                f"«O'qiyabdi» to'lovlar: {debug.get('tolov_soni', 0)} ta\n\n"
                 f"Faoliyat holatlari:\n{faoliyat_matn}\n\n"
                 f"_Bot faqat «O'qiyabdi» bo'lganlarni oladi._",
                 parse_mode="Markdown",
