@@ -376,15 +376,15 @@ async def davomat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await kutish.edit_text("❌ Sizga biriktirilgan faol guruh topilmadi.")
             return
 
-        # Guruhlarni xotirada saqlaymiz
-        context.user_data["guruhlar"] = {g["id"]: g for g in guruhlar}
+        # Guruhlarni xotirada saqlaymiz (ro'yxat sifatida, indeks bo'yicha)
+        context.user_data["guruhlar"] = guruhlar
 
         tugmalar = [
             [InlineKeyboardButton(
                 title_matn(g, "Guruh nomi"),
-                callback_data=f"g:{g['id'][:8]}"
+                callback_data=f"g:{i}"
             )]
-            for g in guruhlar
+            for i, g in enumerate(guruhlar)
         ]
 
         await kutish.edit_text(
@@ -403,10 +403,15 @@ async def guruh_tanlandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     qisqa_id = q.data.split(":")[1]
-    guruhlar = context.user_data.get("guruhlar", {})
-    guruh = next((g for gid, g in guruhlar.items() if gid.startswith(qisqa_id)), None)
+    guruhlar = context.user_data.get("guruhlar")
 
-    if not guruh:
+    if not guruhlar:
+        await q.edit_message_text("⚠️ Sessiya eskirdi. /davomat ni qayta yuboring.")
+        return
+
+    try:
+        guruh = guruhlar[int(qisqa_id)]
+    except (ValueError, IndexError):
         await q.edit_message_text("⚠️ Sessiya eskirdi. /davomat ni qayta yuboring.")
         return
 
@@ -455,12 +460,11 @@ async def sana_tanlandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await q.edit_message_text(
                 f"❌ Faol talaba topilmadi.\n\n"
+                f"📚 Guruh: *{title_matn(guruh, 'Guruh nomi')}*\n\n"
                 f"🔍 *Tashxis:*\n"
                 f"To'lovlar ustuni: `{debug.get('tolov_ustuni')}`\n"
                 f"Bog'langan to'lovlar: {debug.get('tolov_soni', 0)} ta\n\n"
                 f"Faoliyat holatlari:\n{faoliyat_matn}\n\n"
-                f"Guruhdagi relation ustunlar:\n"
-                f"`{debug.get('relation_ustunlar')}`\n\n"
                 f"_Bot faqat «O'qiyabdi» bo'lganlarni oladi._",
                 parse_mode="Markdown",
             )
@@ -599,12 +603,12 @@ async def bekor(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def orqaga(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    guruhlar = context.user_data.get("guruhlar", {})
+    guruhlar = context.user_data.get("guruhlar", [])
     tugmalar = [
         [InlineKeyboardButton(
-            title_matn(g, "Guruh nomi"), callback_data=f"g:{gid[:8]}"
+            title_matn(g, "Guruh nomi"), callback_data=f"g:{i}"
         )]
-        for gid, g in guruhlar.items()
+        for i, g in enumerate(guruhlar)
     ]
     await q.edit_message_text(
         "📚 Qaysi guruh?", reply_markup=InlineKeyboardMarkup(tugmalar)
