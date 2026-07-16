@@ -169,6 +169,18 @@ async def notion_update_page(page_id: str, properties: dict):
         return r.json()
 
 
+async def notion_archive_page(page_id: str):
+    """Notion sahifasini arxivlaydi (trash'ga yuboradi, 30 kun tiklash mumkin)."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.patch(
+            f"{NOTION_API}/pages/{page_id}",
+            headers=NOTION_HEADERS,
+            json={"archived": True},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
 def title_matn(page, prop_name):
     """Title ustunidan matn oladi."""
     try:
@@ -379,9 +391,9 @@ async def grafik_yozish(guruh_page, ustoz_page, sana: str, holat: str,
         return yangi["id"]
 
 
-async def davomat_bormi(guruh_id: str, sana: str):
-    """Shu guruh+sana uchun davomat allaqachon kiritilganmi?"""
-    natija = await notion_query(
+async def davomat_yozuvlari(guruh_id: str, sana: str):
+    """Shu guruh+sana uchun mavjud davomat yozuvlarini qaytaradi."""
+    return await notion_query(
         DB_DAVOMAT,
         {
             "and": [
@@ -390,7 +402,24 @@ async def davomat_bormi(guruh_id: str, sana: str):
             ]
         },
     )
-    return len(natija)
+
+
+async def davomat_bormi(guruh_id: str, sana: str):
+    """Shu guruh+sana uchun davomat allaqachon kiritilganmi?"""
+    return len(await davomat_yozuvlari(guruh_id, sana))
+
+
+async def eski_davomatni_ochir(guruh_id: str, sana: str):
+    """Shu guruh+sana uchun eski davomat yozuvlarini arxivlaydi."""
+    yozuvlar = await davomat_yozuvlari(guruh_id, sana)
+    ochirildi = 0
+    for y in yozuvlar:
+        try:
+            await notion_archive_page(y["id"])
+            ochirildi += 1
+        except Exception as e:
+            log.warning(f"Arxivlashda xato ({y['id']}): {e}")
+    return ochirildi
 
 
 # ─────────────────────────────────────────────
@@ -488,6 +517,7 @@ async def tekshir(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def davomat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Davomat jarayonini boshlaydi - guruhlarni ko'rsatadi."""
     user = update.effective_user
+    context.user_data.pop("qayta", None)
     kutish = await update.message.reply_text("⏳ Guruhlaringiz yuklanmoqda...")
 
     try:
@@ -564,7 +594,7 @@ async def guruh_tanlandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def sana_tanlandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sana tanlandi -> talabalar ro'yxatini chiqaradi."""
+    """Sana tanlandi -> takrorni tekshirib, talabalar ro'yxatini chiqaradi."""
     q = update.callback_query
     await q.answer()
 
@@ -576,6 +606,38 @@ async def sana_tanlandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("⚠️ Sessiya eskirdi. /davomat ni qayta yuboring.")
         return
 
+    await q.edit_message_text("⏳ Tekshirilmoqda...")
+
+    # Takror himoyasi
+    try:
+        soni = await davomat_bormi(guruh["id"], sana_str)
+    except Exception as e:
+        log.warning(f"davomat_bormi xatosi: {e}")
+        soni = 0
+
+    if soni:
+        tugmalar = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Qayta kiritish", callback_data="qayta")],
+            [InlineKeyboardButton("❌ Bekor", callback_data="bekor")],
+        ])
+        await q.edit_message_text(
+            f"⚠️ *Bu kun davomati allaqachon kiritilgan*\n\n"
+            f"📚 {title_matn(guruh, 'Guruh nomi')}\n"
+            f"📅 {sana_matni(date.fromisoformat(sana_str))}\n"
+            f"📝 Notionда {soni} ta yozuv bor\n\n"
+            f"_Qayta kiritsangiz, eski {soni} ta yozuv o'chiriladi "
+            f"va yangisi yoziladi._",
+            parse_mode="Markdown",
+            reply_markup=tugmalar,
+        )
+        return
+
+    await talabalarni_yuklash_q(q, context)
+
+
+async def talabalarni_yuklash_q(q, context):
+    """Talabalar ro'yxatini yuklab chizadi (callback query orqali)."""
+    guruh = context.user_data["guruh"]
     await q.edit_message_text("⏳ Talabalar yuklanmoqda...")
 
     try:
@@ -607,7 +669,7 @@ async def sana_tanlandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await royxatni_chiz(q, context)
 
     except Exception as e:
-        log.exception("sana_tanlandi xatosi")
+        log.exception("talabalarni_yuklash_q xatosi")
         await q.edit_message_text(f"⚠️ Xatolik:\n{e}")
 
 
@@ -692,7 +754,15 @@ async def saqla(update: Update, context: ContextTypes.DEFAULT_TYPE):
         holatlar = context.user_data["holatlar"]
         guruh = context.user_data["guruh"]
         sana = context.user_data["sana"]
+        qayta = context.user_data.get("qayta", False)
         ustoz = await ustozni_top(q.from_user.id)
+
+        # Qayta kiritish bo'lsa - eski yozuvlarni o'chiramiz
+        ochirildi = 0
+        if qayta:
+            await q.edit_message_text("⏳ Eski yozuvlar o'chirilmoqda...")
+            ochirildi = await eski_davomatni_ochir(guruh["id"], sana)
+            await q.edit_message_text("⏳ Notionga saqlanmoqda...")
 
         yozildi = 0
         for t in talabalar:
@@ -722,6 +792,10 @@ async def saqla(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kelmadi = sum(1 for h in holatlar.values() if h == "Kelmadi")
         tatil = sum(1 for h in holatlar.values() if h == "Tatilda")
 
+        ochirish_matn = ""
+        if ochirildi:
+            ochirish_matn = f"🗑 Eski {ochirildi} ta yozuv o'chirildi\n"
+
         await q.edit_message_text(
             f"✅ *Saqlandi!*\n\n"
             f"📚 {title_matn(guruh, 'Guruh nomi')}\n"
@@ -729,10 +803,11 @@ async def saqla(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Keldi: {keldi}\n"
             f"❌ Kelmadi: {kelmadi}\n"
             f"🌙 Ta'tilda: {tatil}\n\n"
+            f"{ochirish_matn}"
             f"Jami {yozildi} ta yozuv Notionga yozildi.",
             parse_mode="Markdown",
         )
-        for k in ["talabalar", "holatlar", "guruh", "sana"]:
+        for k in ["talabalar", "holatlar", "guruh", "sana", "qayta"]:
             context.user_data.pop(k, None)
 
     except Exception as e:
@@ -743,7 +818,7 @@ async def saqla(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bekor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    for k in ["talabalar", "holatlar", "guruh", "sana"]:
+    for k in ["talabalar", "holatlar", "guruh", "sana", "qayta"]:
         context.user_data.pop(k, None)
     await q.edit_message_text("❌ Bekor qilindi.")
 
@@ -863,6 +938,7 @@ async def eslatma_tugma(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Eslatmadagi guruh tugmasi bosildi."""
     q = update.callback_query
     await q.answer()
+    context.user_data.pop("qayta", None)
 
     i = int(q.data.split(":")[1])
     guruhlar = context.user_data.get("eslatma_guruhlar")
@@ -889,41 +965,40 @@ async def eslatma_tugma(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["guruh"] = guruh
     context.user_data["sana"] = sana
 
-    # Davomat allaqachon bormi?
-    soni = await davomat_bormi(guruh["id"], sana)
+    # Eslatma xabari joyida qolsin, yangi xabar ochamiz
+    yangi = await q.message.reply_text("⏳ Tekshirilmoqda...")
+
+    # Takror himoyasi
+    try:
+        soni = await davomat_bormi(guruh["id"], sana)
+    except Exception as e:
+        log.warning(f"davomat_bormi xatosi: {e}")
+        soni = 0
+
     if soni:
         tugmalar = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 Qayta kiritish", callback_data="qayta")],
             [InlineKeyboardButton("❌ Bekor", callback_data="bekor")],
         ])
-        await q.message.reply_text(
-            f"⚠️ *{title_matn(guruh, 'Guruh nomi')}*\n"
-            f"{sana_matni(date.fromisoformat(sana))} uchun davomat "
-            f"allaqachon kiritilgan ({soni} ta yozuv).\n\n"
-            f"Qayta kiritsangiz, eski yozuvlar qoladi va yangilari qo'shiladi.",
+        await yangi.edit_text(
+            f"⚠️ *Bu kun davomati allaqachon kiritilgan*\n\n"
+            f"📚 {title_matn(guruh, 'Guruh nomi')}\n"
+            f"📅 {sana_matni(date.fromisoformat(sana))}\n"
+            f"📝 Notionда {soni} ta yozuv bor\n\n"
+            f"_Qayta kiritsangiz, eski {soni} ta yozuv o'chiriladi "
+            f"va yangisi yoziladi._",
             parse_mode="Markdown",
             reply_markup=tugmalar,
         )
         return
 
-    await talabalarni_yuklash(q, context, yangi_xabar=True)
+    await talabalarni_yuklash_xabar(yangi, context)
 
 
-async def qayta_kiritish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await talabalarni_yuklash(q, context, yangi_xabar=False)
-
-
-async def talabalarni_yuklash(q, context, yangi_xabar=False):
-    """Talabalar ro'yxatini yuklab, ro'yxatni chizadi."""
+async def talabalarni_yuklash_xabar(xabar, context):
+    """Talabalar ro'yxatini yuklab chizadi (Message obyekti orqali)."""
     guruh = context.user_data["guruh"]
-
-    if yangi_xabar:
-        xabar = await q.message.reply_text("⏳ Talabalar yuklanmoqda...")
-    else:
-        await q.edit_message_text("⏳ Talabalar yuklanmoqda...")
-        xabar = q.message
+    await xabar.edit_text("⏳ Talabalar yuklanmoqda...")
 
     try:
         debug = {}
@@ -943,8 +1018,16 @@ async def talabalarni_yuklash(q, context, yangi_xabar=False):
         await royxatni_chiz_xabar(xabar, context)
 
     except Exception as e:
-        log.exception("talabalarni_yuklash xatosi")
+        log.exception("talabalarni_yuklash_xabar xatosi")
         await xabar.edit_text(f"⚠️ Xatolik:\n{e}")
+
+
+async def qayta_kiritish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🔄 Qayta kiritish tugmasi - eski yozuvlar saqlashda o'chiriladi."""
+    q = update.callback_query
+    await q.answer()
+    context.user_data["qayta"] = True
+    await talabalarni_yuklash_q(q, context)
 
 
 # ─────────────────────────────────────────────
