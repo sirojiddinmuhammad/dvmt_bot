@@ -237,9 +237,9 @@ async def ustoz_guruhlari(ustoz_page):
 
 async def guruh_talabalari(guruh_page, debug=None):
     """
-    Guruhdagi faol talabalarni oladi.
-    To'lovlar bazasidan to'g'ridan-to'g'ri filtr bilan:
-      Guruhlar = shu guruh  VA  Faoliyat = "O'qiyabdi"
+    Guruhdagi talabalarni oladi:
+      - Faoliyat = "O'qiyabdi"     -> oddiy (Keldi)
+      - Faoliyat = "Ta'til berildi" -> ta'tilda (Tatilda)
     """
     guruh_id = guruh_page["id"]
 
@@ -248,14 +248,18 @@ async def guruh_talabalari(guruh_page, debug=None):
         {
             "and": [
                 {"property": "Guruhlar", "relation": {"contains": guruh_id}},
-                {"property": "Faoliyat", "status": {"equals": "O'qiyabdi"}},
+                {
+                    "or": [
+                        {"property": "Faoliyat", "status": {"equals": "O'qiyabdi"}},
+                        {"property": "Faoliyat", "status": {"equals": "Ta'til berildi"}},
+                    ]
+                },
             ]
         },
     )
 
     if debug is not None:
         debug["tolov_soni"] = len(tolovlar)
-        # Umumiy holatni ham ko'rsatamiz (tashxis uchun)
         hammasi = await notion_query(
             DB_TOLOVLAR,
             {"property": "Guruhlar", "relation": {"contains": guruh_id}},
@@ -273,17 +277,32 @@ async def guruh_talabalari(guruh_page, debug=None):
             continue
 
         talaba_id = toliba_rel[0]["id"]
+        faoliyat = tolov["properties"].get("Faoliyat", {}).get("status")
+        faoliyat_nomi = faoliyat["name"] if faoliyat else ""
+        tatilda = faoliyat_nomi == "Ta'til berildi"
+
+        # Agar allaqachon bor bo'lsa: "O'qiyabdi" ustunroq
         if talaba_id in talabalar:
+            if not tatilda:
+                talabalar[talaba_id]["tatilda"] = False
             continue
 
         talaba = await notion_get_page(talaba_id)
+
         talabalar[talaba_id] = {
             "id": talaba_id,
             "ism": title_matn(talaba, "Name"),
             "tg_id": talaba["properties"].get("Telegram ID", {}).get("number"),
+            "tatilda": tatilda,
+            "tolov_yaratilgan": tolov.get("created_time"),
         }
 
-    return sorted(talabalar.values(), key=lambda x: x["ism"])
+    # Avval o'qiyotganlar (ism bo'yicha), keyin ta'tildagilar
+    natija = sorted(
+        talabalar.values(),
+        key=lambda x: (x["tatilda"], x["ism"]),
+    )
+    return natija
 
 
 def dars_kunlari_sanalar(guruh_page, nechta=4):
@@ -660,15 +679,17 @@ async def talabalarni_yuklash_q(q, context):
                 f"📚 Guruh: *{title_matn(guruh, 'Guruh nomi')}*\n\n"
                 f"🔍 *Tashxis:*\n"
                 f"Jami to'lovlar: {debug.get('jami_tolov', 0)} ta\n"
-                f"«O'qiyabdi» to'lovlar: {debug.get('tolov_soni', 0)} ta\n\n"
+                f"Faol to'lovlar: {debug.get('tolov_soni', 0)} ta\n\n"
                 f"Faoliyat holatlari:\n{faoliyat_matn}\n\n"
-                f"_Bot faqat «O'qiyabdi» bo'lganlarni oladi._",
+                f"_Bot «O'qiyabdi» va «Ta'til berildi» larni oladi._",
                 parse_mode="Markdown",
             )
             return
 
         # Boshlanishida hammasi "Keldi"
-        context.user_data["holatlar"] = {t["id"]: "Keldi" for t in talabalar}
+        context.user_data["holatlar"] = {
+            t["id"]: ("Tatilda" if t.get("tatilda") else "Keldi") for t in talabalar
+        }
         context.user_data["talabalar"] = talabalar
 
         await royxatni_chiz(q, context)
@@ -695,9 +716,18 @@ async def royxatni_chiz_xabar(xabar_yoki_q, context):
     sana = date.fromisoformat(context.user_data["sana"])
 
     tugmalar = []
+    tatil_boshlandi = False
     for i, t in enumerate(talabalar):
         holat = holatlar[t["id"]]
         belgi = BELGILAR[holat]
+
+        # Ta'tildagilar bo'limi boshlanganda ajratuvchi qo'yamiz
+        if t.get("tatilda") and not tatil_boshlandi:
+            tatil_boshlandi = True
+            tugmalar.append([
+                InlineKeyboardButton("— — — ta'tildagilar — — —", callback_data="hech")
+            ])
+
         tugmalar.append([
             InlineKeyboardButton(f"{belgi} {t['ism']}", callback_data=f"t:{i}")
         ])
@@ -716,7 +746,6 @@ async def royxatni_chiz_xabar(xabar_yoki_q, context):
         f"✅ Keldi → ❌ Kelmadi → 🌙 Ta'tilda\n\n"
         f"✅ {keldi}  ❌ {kelmadi}  🌙 {tatil}"
     )
-
     if hasattr(xabar_yoki_q, "edit_message_text"):
         await xabar_yoki_q.edit_message_text(
             matn, parse_mode="Markdown",
@@ -746,6 +775,11 @@ async def talaba_bosildi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await q.answer(f"{t['ism']}: {BELGILAR[yangi]} {yangi}")
     await royxatni_chiz(q, context)
+
+
+async def hech(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ajratuvchi tugma - hech narsa qilmaydi."""
+    await update.callback_query.answer()
 
 
 async def saqla(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -847,6 +881,69 @@ async def orqaga(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  BUGUNGI DARSLAR / ESLATMA
 # ─────────────────────────────────────────────
 
+# Yangi talaba sozlamalari
+YANGI_KUN = 7      # to'lov yozuvi shu kun ichida yaratilgan bo'lsa
+ESKI_KUN = 45      # shu guruhda oxirgi shuncha kunda boshqa to'lovi bo'lmasa -> yangi
+
+
+async def guruh_yangi_talabalari(guruh_page, kun: date):
+    """
+    Shu guruhdagi YANGI talabalarni topadi.
+    Shartlar:
+      1. To'lov yozuvi oxirgi YANGI_KUN ichida yaratilgan
+      2. Shu talabaning shu guruhda oxirgi ESKI_KUN ichida boshqa to'lovi yo'q
+    Bu davr yangilanishini (eski talaba) tashlaydi,
+    lekin qaytgan va butunlay yangi talabalarni ushlaydi.
+    """
+    guruh_id = guruh_page["id"]
+    yangi_chegara = datetime.now(TZ) - timedelta(days=YANGI_KUN)
+    eski_chegara = datetime.now(TZ) - timedelta(days=ESKI_KUN)
+
+    # Shu guruhning BARCHA to'lovlari (holatidan qat'i nazar)
+    hammasi = await notion_query(
+        DB_TOLOVLAR,
+        {"property": "Guruhlar", "relation": {"contains": guruh_id}},
+    )
+
+    # Talaba -> uning shu guruhdagi to'lovlari [(yaratilgan_vaqt, faoliyat)]
+    talaba_tolovlari = {}
+    for t in hammasi:
+        rel = t["properties"].get("Toliba ismi", {}).get("relation", [])
+        if not rel:
+            continue
+        tid = rel[0]["id"]
+        yaratilgan = t.get("created_time")
+        if not yaratilgan:
+            continue
+        try:
+            vaqt = datetime.fromisoformat(yaratilgan.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        talaba_tolovlari.setdefault(tid, []).append(vaqt)
+
+    yangilar = []
+    for tid, vaqtlar in talaba_tolovlari.items():
+        vaqtlar.sort(reverse=True)
+        oxirgi = vaqtlar[0]
+
+        # 1-shart: oxirgi to'lov yaqinda yaratilganmi?
+        if oxirgi < yangi_chegara:
+            continue
+
+        # 2-shart: undan oldin ESKI_KUN ichida boshqa to'lov bormi?
+        eski_bor = any(v < oxirgi and v >= eski_chegara for v in vaqtlar[1:])
+        if eski_bor:
+            continue  # davr yangilanishi - yangi emas
+
+        try:
+            talaba = await notion_get_page(tid)
+            yangilar.append(title_matn(talaba, "Name"))
+        except Exception as e:
+            log.warning(f"Yangi talaba o'qishda xato: {e}")
+
+    return sorted(yangilar)
+
+
 async def bugungi_darslar_matni(ustoz, kun: date):
     """Ustozning shu kundagi darslarini topib, matn va tugmalar qaytaradi."""
     guruhlar = await ustoz_guruhlari(ustoz)
@@ -865,6 +962,15 @@ async def bugungi_darslar_matni(ustoz, kun: date):
         nom = title_matn(g, "Guruh nomi")
         vaqt = guruh_vaqti(g)
         satrlar.append(f"🕐 *{vaqt}* — {nom}")
+
+        # Yangi talabalar bormi?
+        try:
+            yangilar = await guruh_yangi_talabalari(g, kun)
+            for y in yangilar:
+                satrlar.append(f"      🆕 Yangi: {y}")
+        except Exception as e:
+            log.warning(f"Yangi talaba tekshirishda xato: {e}")
+
         tugmalar.append([
             InlineKeyboardButton(f"📋 {vaqt} {nom}", callback_data=f"e:{i}")
         ])
@@ -1013,11 +1119,13 @@ async def talabalarni_yuklash_xabar(xabar, context):
                 f"❌ Faol talaba topilmadi.\n\n"
                 f"📚 {title_matn(guruh, 'Guruh nomi')}\n"
                 f"Jami to'lovlar: {debug.get('jami_tolov', 0)} ta\n"
-                f"«O'qiyabdi»: {debug.get('tolov_soni', 0)} ta"
+                f"Faol: {debug.get('tolov_soni', 0)} ta"
             )
             return
 
-        context.user_data["holatlar"] = {t["id"]: "Keldi" for t in talabalar}
+        context.user_data["holatlar"] = {
+            t["id"]: ("Tatilda" if t.get("tatilda") else "Keldi") for t in talabalar
+        }
         context.user_data["talabalar"] = talabalar
 
         await royxatni_chiz_xabar(xabar, context)
@@ -1478,6 +1586,7 @@ def main():
     app.add_handler(CallbackQueryHandler(saqla, pattern="^saqla$"))
     app.add_handler(CallbackQueryHandler(bekor, pattern="^bekor$"))
     app.add_handler(CallbackQueryHandler(orqaga, pattern="^orqaga$"))
+    app.add_handler(CallbackQueryHandler(hech, pattern="^hech$"))
 
     # Eslatma
     app.add_handler(CallbackQueryHandler(eslatma_tugma, pattern="^e:"))
