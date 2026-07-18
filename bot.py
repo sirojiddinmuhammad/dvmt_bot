@@ -998,6 +998,15 @@ async def bugungi_darslar_matni(ustoz, kun: date):
             InlineKeyboardButton(f"📋 {vaqt} {nom}", callback_data=f"e:{i}")
         ])
 
+    # Agar 1 tadan ko'p dars bo'lsa - "barchasini qoldirish" tugmasi
+    if len(bugungi) > 1:
+        tugmalar.append([
+            InlineKeyboardButton(
+                "🚫 Barcha darslarni qoldirish",
+                callback_data="hammasi_qoldir"
+            )
+        ])
+
     satrlar.append("\n_Dars berib bo'lgach tugmani bosing._")
 
     return "\n".join(satrlar), InlineKeyboardMarkup(tugmalar), bugungi
@@ -1066,6 +1075,103 @@ async def tungi_eslatma(context: ContextTypes.DEFAULT_TYPE):
             log.warning(f"Eslatma yuborilmadi (tg_id={tg_id}): {e}")
 
     log.info(f"Tungi eslatma tugadi: {yuborildi} ta ustozga yuborildi")
+
+
+async def hammasi_qoldir_sorov(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Barcha darslarni qoldirish - tasdiq so'raydi."""
+    q = update.callback_query
+    await q.answer()
+
+    guruhlar = context.user_data.get("eslatma_guruhlar")
+    if not guruhlar:
+        ustoz = await ustozni_top(q.from_user.id)
+        if not ustoz:
+            await q.message.reply_text("❌ Ustoz topilmadi.")
+            return
+        kun = bugun()
+        _, _, guruhlar = await bugungi_darslar_matni(ustoz, kun)
+        context.user_data["eslatma_guruhlar"] = guruhlar
+        context.user_data["eslatma_sana"] = kun.isoformat()
+
+    if not guruhlar:
+        await q.message.reply_text("⚠️ Eslatma eskirdi. 📅 Bugungi darslar ni bosing.")
+        return
+
+    nomlar = "\n".join(
+        f"   🚫 {title_matn(g, 'Guruh nomi')}" for g in guruhlar
+    )
+
+    tugmalar = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Ha, hammasini qoldirish", callback_data="hammasi_ha")],
+        [InlineKeyboardButton("❌ Yo'q", callback_data="hammasi_yoq")],
+    ])
+
+    await q.message.reply_text(
+        f"⚠️ *Bugungi barcha darslarni qoldirasizmi?*\n\n"
+        f"{nomlar}\n\n"
+        f"_Keyin biror guruhga dars o'tsangiz, "
+        f"davomat kiritganda u \"dars bo'ldi\" ga o'zgaradi._",
+        parse_mode="Markdown",
+        reply_markup=tugmalar,
+    )
+
+
+async def hammasi_qoldir_ha(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tasdiqlandi - barcha bugungi darslarni qoldirildi qiladi."""
+    q = update.callback_query
+    await q.answer()
+
+    guruhlar = context.user_data.get("eslatma_guruhlar")
+    sana = context.user_data.get("eslatma_sana", bugun().isoformat())
+
+    if not guruhlar:
+        await q.edit_message_text("⚠️ Eslatma eskirdi.")
+        return
+
+    await q.edit_message_text("⏳ Saqlanmoqda...")
+
+    ustoz = await ustozni_top(q.from_user.id)
+
+    qoldirildi = 0
+    otkazildi = 0
+    otkazilganlar = []
+
+    for g in guruhlar:
+        # Bu guruhga davomat kiritilgan bo'lsa - tegmaymiz
+        try:
+            soni = await davomat_bormi(g["id"], sana)
+        except Exception:
+            soni = 0
+
+        if soni:
+            otkazildi += 1
+            otkazilganlar.append(title_matn(g, "Guruh nomi"))
+            continue
+
+        try:
+            await grafik_yozish(g, ustoz, sana, "Dars qoldirildi")
+            qoldirildi += 1
+        except Exception as e:
+            log.warning(f"Hammasi qoldirishda xato: {e}")
+
+    matn = (
+        f"✅ *Bajarildi*\n\n"
+        f"🚫 {qoldirildi} ta dars qoldirildi\n"
+    )
+    if otkazildi:
+        nomlar = ", ".join(otkazilganlar)
+        matn += (
+            f"\n⏭ {otkazildi} ta guruhga tegilmadi "
+            f"(davomat kiritilgan):\n_{nomlar}_"
+        )
+
+    await q.edit_message_text(matn, parse_mode="Markdown")
+
+
+async def hammasi_qoldir_yoq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("❌ Bekor qilindi.")
 
 
 async def eslatma_tugma(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1649,6 +1755,9 @@ def main():
     # Eslatma
     app.add_handler(CallbackQueryHandler(eslatma_tugma, pattern="^e:"))
     app.add_handler(CallbackQueryHandler(qayta_kiritish, pattern="^qayta$"))
+    app.add_handler(CallbackQueryHandler(hammasi_qoldir_sorov, pattern="^hammasi_qoldir$"))
+    app.add_handler(CallbackQueryHandler(hammasi_qoldir_ha, pattern="^hammasi_ha$"))
+    app.add_handler(CallbackQueryHandler(hammasi_qoldir_yoq, pattern="^hammasi_yoq$"))
 
     # Dars qoldirish
     app.add_handler(CallbackQueryHandler(qoldirish_guruh, pattern="^q:"))
