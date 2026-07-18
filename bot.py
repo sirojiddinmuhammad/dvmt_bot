@@ -182,6 +182,15 @@ async def notion_archive_page(page_id: str):
         return r.json()
 
 
+def md_himoya(matn: str) -> str:
+    """Markdown maxsus belgilarini himoyalaydi (ism va matnlar uchun)."""
+    if not matn:
+        return matn
+    for belgi in ["\\", "*", "_", "`", "[", "]"]:
+        matn = matn.replace(belgi, "\\" + belgi)
+    return matn
+
+
 def title_matn(page, prop_name):
     """Title ustunidan matn oladi."""
     try:
@@ -1377,7 +1386,7 @@ async def ism_qabul(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await kutish.edit_text(
         f"✅ *So'rovingiz yuborildi*\n\n"
-        f"👤 {ism}\n\n"
+        f"👤 {md_himoya(ism)}\n\n"
         f"Admin tasdiqlagach xabar beramiz.",
         parse_mode="Markdown",
     )
@@ -1388,13 +1397,13 @@ async def ism_qabul(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if len(topilgan) == 1:
-        holat = f"✅ Notionda topildi: *{title_matn(topilgan[0], 'Ustoz ismi')}*"
+        holat = f"✅ Notionda topildi: *{md_himoya(title_matn(topilgan[0], 'Ustoz ismi'))}*"
         tugmalar = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"ok:{sorov_id}")],
             [InlineKeyboardButton("❌ Rad etish", callback_data=f"no:{sorov_id}")],
         ])
     elif len(topilgan) > 1:
-        nomlar = ", ".join(title_matn(u, "Ustoz ismi") for u in topilgan[:5])
+        nomlar = ", ".join(md_himoya(title_matn(u, "Ustoz ismi")) for u in topilgan[:5])
         holat = f"⚠️ Notionda {len(topilgan)} ta o'xshash:\n_{nomlar}_\n\nQo'lda tanlang:"
         tugmalar = InlineKeyboardMarkup(
             [
@@ -1420,7 +1429,7 @@ async def ism_qabul(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=ADMIN_ID,
             text=(
                 f"👤 *Yangi ustoz so'rovi*\n\n"
-                f"Yozgan ismi: *{ism}*\n"
+                f"Yozgan ismi: *{md_himoya(ism)}*\n"
                 f"Telegram: @{user.username or '—'}\n"
                 f"ID: `{user.id}`\n\n"
                 f"{holat}"
@@ -1429,7 +1438,25 @@ async def ism_qabul(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=tugmalar,
         )
     except Exception as e:
-        log.exception(f"Adminga yuborishda xato: {e}")
+        log.warning(f"Adminga Markdown bilan yuborishda xato: {e}")
+        # Markdown buzilgan bo'lishi mumkin - oddiy matn bilan qayta urinamiz
+        try:
+            holat_toza = (
+                holat.replace("*", "").replace("_", "").replace("`", "")
+            )
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"👤 Yangi ustoz so'rovi\n\n"
+                    f"Yozgan ismi: {ism}\n"
+                    f"Telegram: @{user.username or '—'}\n"
+                    f"ID: {user.id}\n\n"
+                    f"{holat_toza}"
+                ),
+                reply_markup=tugmalar,
+            )
+        except Exception as e2:
+            log.exception(f"Adminga oddiy matn bilan ham yuborilmadi: {e2}")
 
 
 async def sorov_tasdiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1511,11 +1538,10 @@ async def sorov_tasdiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=sorov["tg_id"],
                 text=(
-                    f"✅ *Tasdiqlandi!*\n\n"
+                    f"✅ Tasdiqlandi!\n\n"
                     f"Assalomu alaykum, {ustoz_ism}!\n"
                     f"Endi botdan foydalanishingiz mumkin 👇"
                 ),
-                parse_mode="Markdown",
                 reply_markup=MENYU,
             )
         except Exception as e:
