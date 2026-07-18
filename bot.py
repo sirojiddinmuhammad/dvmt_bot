@@ -485,6 +485,20 @@ async def tekshir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Diagnostika: bot qaysi bazalarni ko'ryapti?"""
     kutish = await update.message.reply_text("⏳ Tekshirilmoqda...")
 
+    # Admin holati
+    kim = update.effective_user.id
+    admin_holat = ""
+    if ADMIN_ID == 0:
+        admin_holat = "⚠️ ADMIN_ID sozlanmagan (Railway Variables)\n\n"
+    elif kim == ADMIN_ID:
+        admin_holat = "✅ Siz adminsiz. So'rovlar shu chatga keladi.\n\n"
+    else:
+        admin_holat = (
+            f"ℹ️ Siz admin emassiz.\n"
+            f"Sizning ID: `{kim}`\n"
+            f"Admin ID: `{ADMIN_ID}`\n\n"
+        )
+
     kerakli = {
         DB_USTOZLAR.replace("-", ""): "🙂 Ustozlar",
         DB_GURUHLAR.replace("-", ""): "🚪 Guruhlar",
@@ -519,7 +533,7 @@ async def tekshir(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         korinadigan[bid] = nom
 
-    satrlar = [f"👁 Bot {len(korinadigan)} ta bazani ko'ryapti:\n"]
+    satrlar = [admin_holat + f"👁 Bot {len(korinadigan)} ta bazani ko'ryapti:\n"]
 
     for bid, nom in korinadigan.items():
         belgi = "✅" if bid in kerakli else "▪️"
@@ -1459,16 +1473,36 @@ async def sorov_tasdiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("⏳ Notionga yozilmoqda...")
 
     try:
+        tg_id = sorov["tg_id"]
+
+        # Bu Telegram ID boshqa ustoz(lar)da bo'lsa - tozalaymiz
+        eskilar = await notion_query(
+            DB_USTOZLAR,
+            {"property": "Telegram ID", "number": {"equals": tg_id}},
+        )
+        tozalandi = 0
+        for e in eskilar:
+            if e["id"] != ustoz_id:
+                await notion_update_page(
+                    e["id"], {"Telegram ID": {"number": None}}
+                )
+                tozalandi += 1
+
+        # Yangi ustozga yozamiz
         await notion_update_page(
             ustoz_id,
-            {"Telegram ID": {"number": sorov["tg_id"]}},
+            {"Telegram ID": {"number": tg_id}},
         )
+
+        qoshimcha = ""
+        if tozalandi:
+            qoshimcha = f"\n🧹 {tozalandi} ta eski yozuvdan tozalandi"
 
         await q.edit_message_text(
             f"✅ *Tasdiqlandi*\n\n"
             f"👤 {ustoz_ism}\n"
-            f"ID: `{sorov['tg_id']}`\n\n"
-            f"Notionga yozildi.",
+            f"ID: `{tg_id}`\n\n"
+            f"Notionga yozildi.{qoshimcha}",
             parse_mode="Markdown",
         )
 
@@ -1540,21 +1574,19 @@ async def menyu_matn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def oddiy_matn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menyu tugmasi bo'lmagan matnlar - ism kutilayotgan bo'lsa qabul qilamiz."""
-    if context.user_data.get("ism_kutilyapti"):
-        await ism_qabul(update, context)
-        return
-
+    """Menyu tugmasi bo'lmagan matnlar."""
     # Ro'yxatda bormi?
     ustoz = await ustozni_top(update.effective_user.id)
+
     if ustoz:
+        # Ro'yxatdagi ustoz - menyuni eslatamiz
         await update.message.reply_text(
             "Quyidagi tugmalardan foydalaning 👇", reply_markup=MENYU
         )
-    else:
-        await update.message.reply_text(
-            "Ro'yxatdan o'tish uchun /start ni bosing."
-        )
+        return
+
+    # Ro'yxatda YO'Q - har qanday matnni ism sifatida qabul qilamiz
+    await ism_qabul(update, context)
 
 
 # ─────────────────────────────────────────────
