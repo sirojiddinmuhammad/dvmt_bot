@@ -855,19 +855,28 @@ async def saqla(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kelmadi = sum(1 for h in holatlar.values() if h == "Kelmadi")
         tatil = sum(1 for h in holatlar.values() if h == "Tatilda")
 
+        # Ismlar ro'yxati - holat bo'yicha tartiblangan (Keldi -> Kelmadi -> Ta'tilda)
+        tartib = {"Keldi": 0, "Kelmadi": 1, "Tatilda": 2}
+        saralangan = sorted(
+            talabalar,
+            key=lambda t: (tartib[holatlar[t["id"]]], t["ism"]),
+        )
+        ismlar_satri = "\n".join(
+            f"{BELGILAR[holatlar[t['id']]]} {md_himoya(t['ism'])}"
+            for t in saralangan
+        )
+
         ochirish_matn = ""
         if ochirildi:
-            ochirish_matn = f"🗑 Eski {ochirildi} ta yozuv o'chirildi\n"
+            ochirish_matn = f"🗑 Eski {ochirildi} ta yozuv o'chirildi\n\n"
 
         await q.edit_message_text(
             f"✅ *Saqlandi!*\n\n"
             f"📚 {title_matn(guruh, 'Guruh nomi')}\n"
             f"📅 {sana_matni(date.fromisoformat(sana))}\n\n"
-            f"✅ Keldi: {keldi}\n"
-            f"❌ Kelmadi: {kelmadi}\n"
-            f"🌙 Ta'tilda: {tatil}\n\n"
-            f"{ochirish_matn}"
-            f"Jami {yozildi} ta yozuv Notionga yozildi.",
+            f"✅ Keldi: {keldi}   ❌ Kelmadi: {kelmadi}   🌙 Ta'tilda: {tatil}\n\n"
+            f"{ismlar_satri}\n\n"
+            f"{ochirish_matn}",
             parse_mode="Markdown",
         )
         for k in ["talabalar", "holatlar", "guruh", "sana", "qayta"]:
