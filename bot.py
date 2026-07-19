@@ -215,8 +215,8 @@ async def ustozni_top(telegram_id: int):
 
 async def ustoz_guruhlari(ustoz_page):
     """
-    Ustozning guruhlarini oladi (yopilganlarni tashlab).
-    Guruhlar bazasidan to'g'ridan-to'g'ri filtr bilan - relation limitisiz.
+    Ustozning guruhlarini oladi.
+    Faqat Status = "Dars boshlangan" bo'lganlar ko'rsatiladi.
     """
     ustoz_id = ustoz_page["id"]
 
@@ -227,16 +227,12 @@ async def ustoz_guruhlari(ustoz_page):
 
     guruhlar = []
     for g in guruhlar_hammasi:
-        nom = title_matn(g, "Guruh nomi")
-
-        # 1-filtr: Status
         status = g["properties"].get("Status", {}).get("status")
         status_nomi = status["name"] if status else ""
-        if status_nomi == "Guruh yopilgan":
-            continue
 
-        # 2-filtr: nomida "yopilgan" so'zi bo'lsa
-        if "yopilgan" in nom.lower():
+        # Faqat "Dars boshlangan" ko'rsatiladi.
+        # Qolganlari (Yangi/Qabul ochiq, Davomat qilinmaydi, Guruh yopilgan) yashiriladi.
+        if status_nomi != "Dars boshlangan":
             continue
 
         guruhlar.append(g)
