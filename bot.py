@@ -459,6 +459,7 @@ MENYU = ReplyKeyboardMarkup(
     [
         [KeyboardButton("📋 Davomat")],
         [KeyboardButton("🚫 Dars qoldirish"), KeyboardButton("📅 Bugungi darslar")],
+        [KeyboardButton("🌴 Ta'til olish")],
     ],
     resize_keyboard=True,
 )
@@ -671,7 +672,7 @@ async def sana_tanlandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⚠️ *Bu kun davomati allaqachon kiritilgan*\n\n"
             f"📚 {title_matn(guruh, 'Guruh nomi')}\n"
             f"📅 {sana_matni(date.fromisoformat(sana_str))}\n"
-            f"📝 Notionда {soni} ta yozuv bor\n\n"
+            f"📝 Notionda {soni} ta yozuv bor\n\n"
             f"_Qayta kiritsangiz, eski {soni} ta yozuv o'chiriladi "
             f"va yangisi yoziladi._",
             parse_mode="Markdown",
@@ -1053,11 +1054,32 @@ async def tungi_eslatma(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         try:
+            bosh, tugash = ustoz_tatil_sanalari(ustoz)
+
+            # 1. Ta'til tugagan bo'lsa - sanalarni tozalaymiz
+            if tugash and kun > tugash:
+                await tatil_sanalarini_ochir(ustoz["id"])
+                bosh, tugash = None, None
+
+            # 2. Hozir ta'tilda bo'lsa
+            if bosh and tugash and bosh <= kun <= tugash:
+                # O'sha kungi darslarni qoldiramiz
+                try:
+                    await bir_kun_darslarini_qoldir(ustoz, kun)
+                except Exception as e:
+                    log.warning(f"Ta'til kun qoldirishda xato: {e}")
+
+                # Qaytishga 1 kun qolganda so'raymiz
+                if kun == tugash - timedelta(days=1):
+                    await tatil_qaytish_sorovi(context, ustoz, tg_id, tugash)
+                # Eslatma yubormaymiz
+                continue
+
+            # 3. Oddiy holat - bugungi darslar
             matn, tugmalar, guruhlar = await bugungi_darslar_matni(ustoz, kun)
             if not matn:
                 continue
 
-            # Har guruh uchun "Belgilanmagan" yozuv ochamiz
             for g in guruhlar:
                 mavjud = await grafik_topish(g["id"], kun.isoformat())
                 if not mavjud:
@@ -1075,6 +1097,120 @@ async def tungi_eslatma(context: ContextTypes.DEFAULT_TYPE):
             log.warning(f"Eslatma yuborilmadi (tg_id={tg_id}): {e}")
 
     log.info(f"Tungi eslatma tugadi: {yuborildi} ta ustozga yuborildi")
+
+
+async def tatil_qaytish_sorovi(context, ustoz, tg_id, tugash):
+    """Qaytishga 1 kun qolganda ustozdan so'raydi."""
+    tugmalar = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Ha, qaytdim", callback_data="qaytdim")],
+        [InlineKeyboardButton("🌴 Ta'tilni uzaytiraman", callback_data="uzaytir")],
+    ])
+    try:
+        await context.bot.send_message(
+            chat_id=int(tg_id),
+            text=(
+                f"🌴 *Ta'til tugayapti*\n\n"
+                f"Ertaga ({sana_matni(tugash + timedelta(days=1))}) "
+                f"darslarga qaytasizmi?"
+            ),
+            parse_mode="Markdown",
+            reply_markup=tugmalar,
+        )
+    except Exception as e:
+        log.warning(f"Qaytish so'rovi yuborilmadi: {e}")
+
+
+async def qaytdim(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ustoz ta'tildan qaytdi - sanalarni tozalaymiz."""
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("⏳ ...")
+
+    ustoz = await ustozni_top(q.from_user.id)
+    try:
+        await tatil_sanalarini_ochir(ustoz["id"])
+        await q.edit_message_text(
+            "✅ *Xush kelibsiz!*\n\n"
+            "Kunlik eslatmalar tiklandi. "
+            "Ertadan darslaringiz haqida xabar beramiz.",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        log.exception("qaytdim xatosi")
+        await q.edit_message_text(f"⚠️ Xatolik:\n{e}")
+
+
+async def uzaytir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ta'tilni uzaytirish - yangi tugash sanasini so'raydi."""
+    q = update.callback_query
+    await q.answer()
+
+    ustoz = await ustozni_top(q.from_user.id)
+    bosh, eski_tugash = ustoz_tatil_sanalari(ustoz)
+    if not eski_tugash:
+        await q.edit_message_text("⚠️ Ta'til sanasi topilmadi.")
+        return
+
+    context.user_data["uzaytir_bosh"] = bosh.isoformat() if bosh else None
+    context.user_data["uzaytir_eski_tugash"] = eski_tugash.isoformat()
+
+    # Yangi tugash variantlari (eski tugashdan keyin)
+    tugmalar = []
+    for i in range(1, 21, 2):
+        qator = []
+        for j in range(2):
+            d = eski_tugash + timedelta(days=i + j)
+            qator.append(InlineKeyboardButton(
+                sana_matni(d), callback_data=f"uz:{d.isoformat()}"
+            ))
+        tugmalar.append(qator)
+
+    await q.edit_message_text(
+        f"🌴 *Ta'tilni uzaytirish*\n\n"
+        f"Hozirgi tugash: {sana_matni(eski_tugash)}\n\n"
+        f"Yangi qaytish kuni qaysi?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(tugmalar),
+    )
+
+
+async def uzaytir_tugash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Yangi tugash sanasi tanlandi - ta'til tugash sanasini yangilaydi."""
+    q = update.callback_query
+    await q.answer()
+
+    yangi_tugash_str = q.data.split(":", 1)[1]
+    eski_tugash_str = context.user_data.get("uzaytir_eski_tugash")
+
+    if not eski_tugash_str:
+        await q.edit_message_text("⚠️ Sessiya eskirdi.")
+        return
+
+    yangi_tugash = date.fromisoformat(yangi_tugash_str)
+
+    await q.edit_message_text("⏳ Uzaytirilmoqda...")
+
+    ustoz = await ustozni_top(q.from_user.id)
+    try:
+        # Yangi tugash sanasini yozamiz
+        await notion_update_page(ustoz["id"], {
+            "Tatil tugashi": {"date": {"start": yangi_tugash.isoformat()}},
+        })
+
+        await q.edit_message_text(
+            f"✅ *Ta'til uzaytirildi*\n\n"
+            f"📅 Yangi qaytish: {sana_matni(yangi_tugash + timedelta(days=1))}\n\n"
+            f"_Har kungi darslar avtomatik qoldiriladi._\n"
+            f"_Qaytishdan 1 kun oldin yana so'raymiz._",
+            parse_mode="Markdown",
+        )
+
+        for k in ["uzaytir_bosh", "uzaytir_eski_tugash"]:
+            context.user_data.pop(k, None)
+
+    except Exception as e:
+        log.exception("uzaytir_tugash xatosi")
+        await q.edit_message_text(f"⚠️ Xatolik:\n{e}")
 
 
 async def hammasi_qoldir_sorov(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1224,7 +1360,7 @@ async def eslatma_tugma(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⚠️ *Bu kun davomati allaqachon kiritilgan*\n\n"
             f"📚 {title_matn(guruh, 'Guruh nomi')}\n"
             f"📅 {sana_matni(date.fromisoformat(sana))}\n"
-            f"📝 Notionда {soni} ta yozuv bor\n\n"
+            f"📝 Notionda {soni} ta yozuv bor\n\n"
             f"_Qayta kiritsangiz, eski {soni} ta yozuv o'chiriladi "
             f"va yangisi yoziladi._",
             parse_mode="Markdown",
@@ -1277,6 +1413,304 @@ async def qayta_kiritish(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 
 SABABLAR = ["Kasallik", "Sayohat", "Oilaviy sabab", "Texnik muammo", "Boshqa"]
+
+
+# ─────────────────────────────────────────────
+#  TA'TIL
+# ─────────────────────────────────────────────
+
+def ustoz_tatil_sanalari(ustoz_page):
+    """Ustozning ta'til boshlanish/tugash sanalarini qaytaradi (date yoki None)."""
+    props = ustoz_page["properties"]
+
+    def sana_ol(nom):
+        d = props.get(nom, {}).get("date")
+        if d and d.get("start"):
+            try:
+                return date.fromisoformat(d["start"][:10])
+            except ValueError:
+                return None
+        return None
+
+    return sana_ol("Tatil boshlanishi"), sana_ol("Tatil tugashi")
+
+
+def ustoz_tatildami(ustoz_page, kun: date):
+    """Shu kunda ustoz ta'tildami?"""
+    bosh, tugash = ustoz_tatil_sanalari(ustoz_page)
+    if not bosh or not tugash:
+        return False
+    return bosh <= kun <= tugash
+
+
+async def tatil_sanalarini_yoz(ustoz_id, bosh: date, tugash: date):
+    """Ustozga ta'til sanalarini yozadi."""
+    await notion_update_page(ustoz_id, {
+        "Tatil boshlanishi": {"date": {"start": bosh.isoformat()}},
+        "Tatil tugashi": {"date": {"start": tugash.isoformat()}},
+    })
+
+
+async def tatil_sanalarini_ochir(ustoz_id):
+    """Ustozning ta'til sanalarini tozalaydi."""
+    await notion_update_page(ustoz_id, {
+        "Tatil boshlanishi": {"date": None},
+        "Tatil tugashi": {"date": None},
+    })
+
+
+async def bir_kun_darslarini_qoldir(ustoz, kun: date):
+    """
+    Bitta kundagi barcha darslarni "Dars qoldirildi" qiladi (sabab: Ta'til).
+    Davomat kiritilgan darsga tegmaydi.
+    Qaytadi: (qoldirilgan_soni, otkazilgan_soni)
+    """
+    guruhlar = await ustoz_guruhlari(ustoz)
+    qoldirildi = 0
+    otkazildi = 0
+    sana_str = kun.isoformat()
+
+    for g in guruhlar:
+        if not bugun_darsmi(g, kun):
+            continue
+
+        try:
+            soni = await davomat_bormi(g["id"], sana_str)
+        except Exception:
+            soni = 0
+
+        if soni:
+            otkazildi += 1
+            continue
+
+        try:
+            await grafik_yozish(g, ustoz, sana_str, "Dars qoldirildi", sabab="Ta'til")
+            qoldirildi += 1
+        except Exception as e:
+            log.warning(f"Ta'til kun darsini qoldirishda xato: {e}")
+
+    return qoldirildi, otkazildi
+
+
+async def tatil_olish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🌴 Ta'til olish tugmasi - boshlanish sanasini so'raydi."""
+    user = update.effective_user
+    ustoz = await ustozni_top(user.id)
+    if not ustoz:
+        await update.message.reply_text("❌ Siz ustozlar ro'yxatida topilmadingiz.")
+        return
+
+    # Allaqachon ta'tildami?
+    bosh, tugash = ustoz_tatil_sanalari(ustoz)
+    if bosh and tugash:
+        tugmalar = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Ta'tilni bekor qilish", callback_data="tatil_bekor_joriy")],
+            [InlineKeyboardButton("❌ Yopish", callback_data="tatil_yopish")],
+        ])
+        await update.message.reply_text(
+            f"🌴 *Siz allaqachon ta'tildasiz*\n\n"
+            f"📅 {sana_matni(bosh)} — {sana_matni(tugash)}\n\n"
+            f"_Ta'tilni bekor qilsangiz, darslar tiklanadi._",
+            parse_mode="Markdown",
+            reply_markup=tugmalar,
+        )
+        return
+
+    context.user_data["tatil_bosqich"] = "boshlanish"
+
+    # Yaqin kunlarni tugma qilib beramiz
+    kun = bugun()
+    tugmalar = []
+    for i in range(0, 14, 2):
+        qator = []
+        for j in range(2):
+            d = kun + timedelta(days=i + j)
+            qator.append(InlineKeyboardButton(
+                sana_matni(d), callback_data=f"tb:{d.isoformat()}"
+            ))
+        tugmalar.append(qator)
+
+    await update.message.reply_text(
+        "🌴 *Ta'til olish*\n\nQaysi kundan boshlanadi?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(tugmalar),
+    )
+
+
+async def tatil_boshlanish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ta'til boshlanish sanasi tanlandi -> tugash sanasini so'raydi."""
+    q = update.callback_query
+    await q.answer()
+
+    bosh_str = q.data.split(":", 1)[1]
+    context.user_data["tatil_bosh"] = bosh_str
+    bosh = date.fromisoformat(bosh_str)
+
+    # Tugash sanasi variantlari (boshlanishdan keyin)
+    tugmalar = []
+    for i in range(1, 29, 2):
+        qator = []
+        for j in range(2):
+            d = bosh + timedelta(days=i + j - 1)
+            if d < bosh:
+                continue
+            qator.append(InlineKeyboardButton(
+                sana_matni(d), callback_data=f"tt:{d.isoformat()}"
+            ))
+        if qator:
+            tugmalar.append(qator)
+
+    await q.edit_message_text(
+        f"🌴 *Ta'til olish*\n\n"
+        f"Boshlanishi: {sana_matni(bosh)}\n\n"
+        f"Qaysi kungacha (shu kun ham kiradi)?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(tugmalar),
+    )
+
+
+async def tatil_tugash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tugash sanasi tanlandi -> tasdiq so'raydi."""
+    q = update.callback_query
+    await q.answer()
+
+    tugash_str = q.data.split(":", 1)[1]
+    bosh_str = context.user_data.get("tatil_bosh")
+    if not bosh_str:
+        await q.edit_message_text("⚠️ Sessiya eskirdi. 🌴 Ta'til olish ni qayta bosing.")
+        return
+
+    context.user_data["tatil_tugash"] = tugash_str
+    bosh = date.fromisoformat(bosh_str)
+    tugash = date.fromisoformat(tugash_str)
+
+    if tugash < bosh:
+        await q.edit_message_text("⚠️ Tugash sanasi boshlanishdan oldin bo'lolmaydi.")
+        return
+
+    kunlar = (tugash - bosh).days + 1
+
+    tugmalar = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Tasdiqlash", callback_data="tatil_ha")],
+        [InlineKeyboardButton("❌ Bekor", callback_data="tatil_yoq")],
+    ])
+
+    await q.edit_message_text(
+        f"🌴 *Ta'til - tasdiqlash*\n\n"
+        f"📅 {sana_matni(bosh)} — {sana_matni(tugash)}\n"
+        f"⏳ {kunlar} kun\n\n"
+        f"Bu davrdagi barcha darslaringiz "
+        f"«Dars qoldirildi» bo'ladi.\n"
+        f"_(Davomat kiritilgan darslar saqlanadi.)_",
+        parse_mode="Markdown",
+        reply_markup=tugmalar,
+    )
+
+
+async def tatil_tasdiq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ta'til tasdiqlandi -> sanalarni yozadi, darslarni qoldiradi."""
+    q = update.callback_query
+    await q.answer()
+
+    bosh_str = context.user_data.get("tatil_bosh")
+    tugash_str = context.user_data.get("tatil_tugash")
+    if not bosh_str or not tugash_str:
+        await q.edit_message_text("⚠️ Sessiya eskirdi.")
+        return
+
+    bosh = date.fromisoformat(bosh_str)
+    tugash = date.fromisoformat(tugash_str)
+
+    await q.edit_message_text("⏳ Ta'til rasmiylashtirilmoqda...")
+
+    ustoz = await ustozni_top(q.from_user.id)
+    ustoz_ism = title_matn(ustoz, "Ustoz ismi")
+
+    try:
+        # Sanalarni yozamiz
+        await tatil_sanalarini_yoz(ustoz["id"], bosh, tugash)
+
+        # Faqat AGAR ta'til bugundan boshlansa - bugungi darsni qoldiramiz.
+        # Qolgan kunlarni har kuni 00:20 da tungi eslatma qoldiradi.
+        qoldirildi = 0
+        otkazildi = 0
+        if bosh <= bugun() <= tugash:
+            qoldirildi, otkazildi = await bir_kun_darslarini_qoldir(ustoz, bugun())
+
+        kunlar = (tugash - bosh).days + 1
+        matn = (
+            f"✅ *Ta'til rasmiylashtirildi*\n\n"
+            f"📅 {sana_matni(bosh)} — {sana_matni(tugash)}\n"
+            f"⏳ {kunlar} kun\n"
+        )
+        if qoldirildi:
+            matn += f"🚫 Bugungi {qoldirildi} ta dars qoldirildi\n"
+        matn += (
+            f"\n_Har kungi darslar avtomatik qoldiriladi._\n"
+            f"_Ta'til davomida kunlik eslatmalar to'xtaydi._\n"
+            f"_Qaytishdan 1 kun oldin so'raymiz._"
+        )
+
+        await q.edit_message_text(matn, parse_mode="Markdown")
+
+        # Adminga xabar
+        if ADMIN_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        f"🌴 *Ustoz ta'til oldi*\n\n"
+                        f"👤 {md_himoya(ustoz_ism)}\n"
+                        f"📅 {sana_matni(bosh)} — {sana_matni(tugash)}\n"
+                        f"⏳ {(tugash - bosh).days + 1} kun\n\n"
+                        f"_Darslar har kuni avtomatik qoldiriladi._"
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                log.warning(f"Adminga ta'til xabari yuborilmadi: {e}")
+
+        for k in ["tatil_bosh", "tatil_tugash", "tatil_bosqich"]:
+            context.user_data.pop(k, None)
+
+    except Exception as e:
+        log.exception("tatil_tasdiq xatosi")
+        await q.edit_message_text(f"⚠️ Xatolik:\n{e}")
+
+
+async def tatil_bekor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ta'til olishni bekor qilish (jarayon)."""
+    q = update.callback_query
+    await q.answer()
+    for k in ["tatil_bosh", "tatil_tugash", "tatil_bosqich"]:
+        context.user_data.pop(k, None)
+    await q.edit_message_text("❌ Bekor qilindi.")
+
+
+async def tatil_yopish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("Yopildi.")
+
+
+async def tatil_bekor_joriy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Joriy (amaldagi) ta'tilni bekor qilish - sanalarni tozalaydi."""
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("⏳ Ta'til bekor qilinmoqda...")
+
+    ustoz = await ustozni_top(q.from_user.id)
+    try:
+        await tatil_sanalarini_ochir(ustoz["id"])
+        await q.edit_message_text(
+            "✅ Ta'til bekor qilindi.\n\n"
+            "Kunlik eslatmalar tiklandi.\n\n"
+            "_Eslatma: qoldirilgan darslar Notionda «Dars qoldirildi» "
+            "bo'lib qoladi. Kerak bo'lsa qo'lda o'zgartiring._"
+        )
+    except Exception as e:
+        log.exception("tatil_bekor_joriy xatosi")
+        await q.edit_message_text(f"⚠️ Xatolik:\n{e}")
 
 
 async def dars_qoldirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1703,6 +2137,8 @@ async def menyu_matn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await dars_qoldirish(update, context)
     elif matn == "📅 Bugungi darslar":
         await bugungi_darslar(update, context)
+    elif matn == "🌴 Ta'til olish":
+        await tatil_olish(update, context)
 
 
 async def oddiy_matn(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1735,7 +2171,7 @@ def main():
 
     # Menyu tugmalari
     app.add_handler(MessageHandler(
-        filters.Regex("^(📋 Davomat|🚫 Dars qoldirish|📅 Bugungi darslar)$"),
+        filters.Regex("^(📋 Davomat|🚫 Dars qoldirish|📅 Bugungi darslar|🌴 Ta'til olish)$"),
         menyu_matn,
     ))
 
@@ -1763,6 +2199,17 @@ def main():
     app.add_handler(CallbackQueryHandler(qoldirish_guruh, pattern="^q:"))
     app.add_handler(CallbackQueryHandler(qoldirish_sana, pattern="^qs:"))
     app.add_handler(CallbackQueryHandler(qoldirish_sabab, pattern="^qb:"))
+
+    # Ta'til
+    app.add_handler(CallbackQueryHandler(tatil_boshlanish, pattern="^tb:"))
+    app.add_handler(CallbackQueryHandler(tatil_tugash, pattern="^tt:"))
+    app.add_handler(CallbackQueryHandler(tatil_tasdiq, pattern="^tatil_ha$"))
+    app.add_handler(CallbackQueryHandler(tatil_bekor, pattern="^tatil_yoq$"))
+    app.add_handler(CallbackQueryHandler(tatil_yopish, pattern="^tatil_yopish$"))
+    app.add_handler(CallbackQueryHandler(tatil_bekor_joriy, pattern="^tatil_bekor_joriy$"))
+    app.add_handler(CallbackQueryHandler(qaytdim, pattern="^qaytdim$"))
+    app.add_handler(CallbackQueryHandler(uzaytir, pattern="^uzaytir$"))
+    app.add_handler(CallbackQueryHandler(uzaytir_tugash, pattern="^uz:"))
 
     # Oddiy matn (ism qabul qilish) - eng oxirida bo'lishi kerak
     app.add_handler(MessageHandler(
