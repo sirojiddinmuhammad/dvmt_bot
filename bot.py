@@ -1000,8 +1000,14 @@ async def bugungi_darslar_matni(ustoz, kun: date):
         except Exception as e:
             log.warning(f"Yangi talaba tekshirishda xato: {e}")
 
+        # Tugmaga guruh ID va sanani to'g'ridan-to'g'ri yozamiz.
+        # Shunda bot xotirasi o'chsa ham tugma to'g'ri ishlaydi.
+        gid = g["id"].replace("-", "")
         tugmalar.append([
-            InlineKeyboardButton(f"📋 {vaqt} {nom}", callback_data=f"e:{i}")
+            InlineKeyboardButton(
+                f"📋 {vaqt} {nom}",
+                callback_data=f"e:{gid}:{kun.isoformat()}"
+            )
         ])
 
     # Agar 1 tadan ko'p dars bo'lsa - "barchasini qoldirish" tugmasi
@@ -1009,7 +1015,7 @@ async def bugungi_darslar_matni(ustoz, kun: date):
         tugmalar.append([
             InlineKeyboardButton(
                 "🚫 Barcha darslarni qoldirish",
-                callback_data="hammasi_qoldir"
+                callback_data=f"hammasi_qoldir:{kun.isoformat()}"
             )
         ])
 
@@ -1034,9 +1040,6 @@ async def bugungi_darslar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not matn:
         await kutish.edit_text(f"😌 {sana_matni(kun)}\n\nBugun darsingiz yo'q.")
         return
-
-    context.user_data["eslatma_guruhlar"] = guruhlar
-    context.user_data["eslatma_sana"] = kun.isoformat()
 
     await kutish.edit_text(matn, parse_mode="Markdown", reply_markup=tugmalar)
 
@@ -1223,23 +1226,30 @@ async def hammasi_qoldir_sorov(update: Update, context: ContextTypes.DEFAULT_TYP
     q = update.callback_query
     await q.answer()
 
-    guruhlar = context.user_data.get("eslatma_guruhlar")
-    if not guruhlar:
-        ustoz = await ustozni_top(q.from_user.id)
-        if not ustoz:
-            await q.message.reply_text("❌ Ustoz topilmadi.")
-            return
-        kun = bugun()
-        _, _, guruhlar = await bugungi_darslar_matni(ustoz, kun)
-        context.user_data["eslatma_guruhlar"] = guruhlar
-        context.user_data["eslatma_sana"] = kun.isoformat()
+    # Sana tugmadan olinadi (xotiraga bog'liq emas)
+    qismlar = q.data.split(":")
+    sana_str = qismlar[1] if len(qismlar) > 1 else bugun().isoformat()
+    kun = date.fromisoformat(sana_str)
 
-    if not guruhlar:
-        await q.message.reply_text("⚠️ Eslatma eskirdi. 📅 Bugungi darslar ni bosing.")
+    ustoz = await ustozni_top(q.from_user.id)
+    if not ustoz:
+        await q.message.reply_text("❌ Ustoz topilmadi.")
         return
 
+    kutish = await q.message.reply_text("⏳ Yuklanmoqda...")
+
+    guruhlar = await ustoz_guruhlari(ustoz)
+    kungi = [g for g in guruhlar if bugun_darsmi(g, kun)]
+
+    if not kungi:
+        await kutish.edit_text("⚠️ Bu kunda dars topilmadi.")
+        return
+
+    context.user_data["hammasi_guruhlar"] = kungi
+    context.user_data["hammasi_sana"] = sana_str
+
     nomlar = "\n".join(
-        f"   🚫 {title_matn(g, 'Guruh nomi')}" for g in guruhlar
+        f"   🚫 {title_matn(g, 'Guruh nomi')}" for g in kungi
     )
 
     tugmalar = InlineKeyboardMarkup([
@@ -1247,8 +1257,8 @@ async def hammasi_qoldir_sorov(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("❌ Yo'q", callback_data="hammasi_yoq")],
     ])
 
-    await q.message.reply_text(
-        f"⚠️ *Bugungi barcha darslarni qoldirasizmi?*\n\n"
+    await kutish.edit_text(
+        f"⚠️ *{sana_matni(kun)} — barcha darslarni qoldirasizmi?*\n\n"
         f"{nomlar}\n\n"
         f"_Keyin biror guruhga dars o'tsangiz, "
         f"davomat kiritganda u \"dars bo'ldi\" ga o'zgaradi._",
@@ -1262,11 +1272,13 @@ async def hammasi_qoldir_ha(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    guruhlar = context.user_data.get("eslatma_guruhlar")
-    sana = context.user_data.get("eslatma_sana", bugun().isoformat())
+    guruhlar = context.user_data.get("hammasi_guruhlar")
+    sana = context.user_data.get("hammasi_sana", bugun().isoformat())
 
     if not guruhlar:
-        await q.edit_message_text("⚠️ Eslatma eskirdi.")
+        await q.edit_message_text(
+            "⚠️ So'rov eskirdi. Tugmani qayta bosing."
+        )
         return
 
     await q.edit_message_text("⏳ Saqlanmoqda...")
@@ -1321,33 +1333,31 @@ async def eslatma_tugma(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     context.user_data.pop("qayta", None)
 
-    i = int(q.data.split(":")[1])
-    guruhlar = context.user_data.get("eslatma_guruhlar")
+    qismlar = q.data.split(":")
 
-    # Eslatma eski bo'lsa, qaytadan yuklaymiz
-    if not guruhlar:
-        ustoz = await ustozni_top(q.from_user.id)
-        if not ustoz:
-            await q.message.reply_text("❌ Ustoz topilmadi.")
-            return
-        kun = bugun()
-        _, _, guruhlar = await bugungi_darslar_matni(ustoz, kun)
-        context.user_data["eslatma_guruhlar"] = guruhlar
-        context.user_data["eslatma_sana"] = kun.isoformat()
-
-    try:
-        guruh = guruhlar[i]
-    except (IndexError, TypeError):
-        await q.message.reply_text("⚠️ Eslatma eskirdi. 📅 Bugungi darslar ni bosing.")
+    # Yangi format: e:<guruh_id>:<sana>
+    if len(qismlar) >= 3:
+        gid = qismlar[1]
+        sana = qismlar[2]
+    else:
+        # Eski format (e:<raqam>) - eski xabarlar uchun
+        await q.message.reply_text(
+            "⚠️ Bu eski eslatma. 📅 Bugungi darslar tugmasini bosing."
+        )
         return
 
-    sana = context.user_data.get("eslatma_sana", bugun().isoformat())
+    yangi = await q.message.reply_text("⏳ Yuklanmoqda...")
+
+    # Guruhni ID orqali to'g'ridan-to'g'ri olamiz
+    try:
+        guruh = await notion_get_page(gid)
+    except Exception as e:
+        log.warning(f"Guruh olishda xato ({gid}): {e}")
+        await yangi.edit_text("⚠️ Guruh topilmadi. 📅 Bugungi darslar ni bosing.")
+        return
 
     context.user_data["guruh"] = guruh
     context.user_data["sana"] = sana
-
-    # Eslatma xabari joyida qolsin, yangi xabar ochamiz
-    yangi = await q.message.reply_text("⏳ Tekshirilmoqda...")
 
     # Takror himoyasi
     try:
@@ -2196,7 +2206,7 @@ def main():
     # Eslatma
     app.add_handler(CallbackQueryHandler(eslatma_tugma, pattern="^e:"))
     app.add_handler(CallbackQueryHandler(qayta_kiritish, pattern="^qayta$"))
-    app.add_handler(CallbackQueryHandler(hammasi_qoldir_sorov, pattern="^hammasi_qoldir$"))
+    app.add_handler(CallbackQueryHandler(hammasi_qoldir_sorov, pattern="^hammasi_qoldir"))
     app.add_handler(CallbackQueryHandler(hammasi_qoldir_ha, pattern="^hammasi_ha$"))
     app.add_handler(CallbackQueryHandler(hammasi_qoldir_yoq, pattern="^hammasi_yoq$"))
 
